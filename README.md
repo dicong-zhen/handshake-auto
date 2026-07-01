@@ -100,7 +100,7 @@ scroll → click → …* — and run it on a loop, with human-like delays.
 | **Capture + ask AI** | Screenshot the region, ask the AI, store the answer (optionally type it) |
 | **Type AI answer** | Type the most recent AI answer at a point/field |
 | **AI: find & click** | Describe an element; the AI locates it in the screenshot and clicks it |
-| **AI check — stop if condition fails** | Capture the screen and ask the AI to verify a condition (e.g. "a green success message is visible"). If it isn't met (after the configured re-check attempts), the workflow **stops** |
+| **AI check — stop if condition fails** | Capture the screen and ask the AI to verify a condition (e.g. "a green success message is visible"). If it isn't met (after the configured re-check attempts), the workflow **stops** — or, if you enable **Run restart workflow** on that step, it runs the **Restart** tab steps once and then starts the main workflow again from step 1 |
 | **Crop image → paste to window** | Crops a screen rectangle (manually picked **or located by the AI from your description**), copies it to the clipboard as a real **image**, clicks the destination field, and pastes with Ctrl+V (optional key after) |
 | **AI read → paste to other window** | One step: capture → AI reads (your prompt) → copy to clipboard → click the destination field (focuses the right window) → optional clear → Ctrl+V → optional key |
 | **Remember clipboard** | Save the current clipboard text into a named memory slot |
@@ -115,8 +115,28 @@ scroll → click → …* — and run it on a loop, with human-like delays.
    For click/type targets, use **🎯 Pick** to left-click the spot on screen.
 3. Reorder with ▲ / ▼, edit with ✎, remove with ✕, or toggle a step on/off
    with its checkbox.
-4. Set **repeat ×N** to run the whole sequence multiple times.
-5. **▶ Run workflow** to start, **⏹ Stop** to cancel. **💾 Save** persists it.
+4. Set **repeat ×N** to run the whole sequence multiple times (saved to
+   `config.json` when you change it, run the workflow, or close the app).
+5. **▶ Run workflow** to start, **⏹ Stop** to cancel. **💾 Save** persists steps.
+
+### Restart workflow (recovery after a failed AI check)
+
+When an **AI check — stop if condition fails** step does not pass, you may need
+to click away a dialog, go back, or retry before running the main sequence
+again. Use the **Restart** tab for that recovery sequence:
+
+1. Go to the **Restart** tab and add the recovery steps (same step types as the
+   main workflow).
+2. On the failing **AI check** step in the main workflow, enable **When check
+   fails, run restart workflow then restart main workflow from step 1**.
+3. **💾 Save** on both tabs (or close the app — settings auto-save).
+
+When the check fails during a run, the app runs the restart steps once, then
+starts the **main workflow from step 1**, and can repeat that recovery cycle
+without limit while the run continues. If the checkbox is off, behaviour is
+unchanged: the workflow stops.
+
+Use **▶ Run restart** on the Restart tab to test the recovery steps alone.
 
 ### AI: find & click
 

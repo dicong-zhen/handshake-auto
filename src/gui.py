@@ -11,8 +11,8 @@ import customtkinter as ctk
 from PIL import Image
 
 from . import ai_client, automation, screen, workflow
-from .config import AppConfig, Point, Region
-from .workflow import STEP_KINDS, RunContext, Step, WorkflowRunner
+from .config import AppConfig, HISTORY_PATH, Point, Region
+from .workflow import STEP_KINDS, RunContext, RunRecord, Step, WorkflowRunner
 
 PREVIEW_MAX = (460, 300)
 
@@ -23,6 +23,203 @@ COMMON_KEYS = [
     "ctrl+a", "ctrl+c", "ctrl+v", "ctrl+x", "ctrl+z", "ctrl+s", "ctrl+f",
     "alt+tab", "f5",
 ]
+
+
+class _StepRow:
+    """Widget handles for one workflow step row (avoids full list rebuilds)."""
+
+    __slots__ = ("frame", "pos_var", "toggle_btn", "summary_label")
+
+    def __init__(
+        self,
+        frame: ctk.CTkFrame,
+        pos_var: ctk.StringVar,
+        toggle_btn: ctk.CTkButton,
+        summary_label: ctk.CTkLabel,
+    ) -> None:
+        self.frame = frame
+        self.pos_var = pos_var
+        self.toggle_btn = toggle_btn
+        self.summary_label = summary_label
+
+
+class _StepListController:
+    """Editable step list shared by the Workflow and Restart tabs."""
+
+    def __init__(
+        self,
+        app: "App",
+        scroll_frame: ctk.CTkScrollableFrame,
+        steps: list[Step],
+        *,
+        empty_text: str,
+        on_run_from,
+        on_run_only,
+    ) -> None:
+        self.app = app
+        self.frame = scroll_frame
+        self.steps = steps
+        self.empty_text = empty_text
+        self.on_run_from = on_run_from
+        self.on_run_only = on_run_only
+        self.rows: list[_StepRow] = []
+
+    def refresh(self) -> None:
+        self.rows.clear()
+        for child in self.frame.winfo_children():
+            child.destroy()
+
+        if not self.steps:
+            ctk.CTkLabel(
+                self.frame, text=self.empty_text,
+                text_color="gray", justify="left",
+            ).grid(row=0, column=0, sticky="w", padx=12, pady=20)
+            return
+
+        for i, step in enumerate(self.steps):
+            self.rows.append(self._create_row(i, step))
+
+    def _create_row(self, index: int, step: Step) -> _StepRow:
+        row = ctk.CTkFrame(self.frame)
+        row.grid(row=index, column=0, sticky="ew", padx=4, pady=3)
+        row.grid_columnconfigure(2, weight=1)
+
+        pos_var = ctk.StringVar(value=str(index + 1))
+        pos_entry = ctk.CTkEntry(row, width=42, textvariable=pos_var, justify="center")
+        pos_entry.grid(row=0, column=0, padx=(8, 2), pady=6)
+        pos_entry.bind(
+            "<Return>",
+            lambda _e, idx=index, v=pos_var: self.move_to_position(idx, v.get()),
+        )
+        pos_entry.bind("<FocusIn>", lambda _e, w=pos_entry: w.select_range(0, "end"))
+
+        toggle_btn = ctk.CTkButton(
+            row,
+            text="On" if step.enabled else "Off",
+            width=44,
+            fg_color="#2f6f43" if step.enabled else "#5a5a5a",
+            hover_color="#27583a" if step.enabled else "#4a4a4a",
+            command=lambda idx=index: self.toggle(idx),
+        )
+        toggle_btn.grid(row=0, column=1, padx=2)
+
+        text, text_color = App._step_row_summary(step)
+        summary_label = ctk.CTkLabel(
+            row, text=text, anchor="w", text_color=text_color,
+            font=("Segoe UI", 12),
+        )
+        summary_label.grid(row=0, column=2, sticky="ew", padx=6)
+
+        ctk.CTkButton(
+            row, text="▶ here", width=56, fg_color="#2f6f43", hover_color="#27583a",
+            command=lambda idx=index: self.on_run_from(idx),
+        ).grid(row=0, column=3, padx=(2, 1), pady=4)
+        ctk.CTkButton(
+            row, text="▶ one", width=52, fg_color="#2f6f43", hover_color="#27583a",
+            command=lambda idx=index: self.on_run_only(idx),
+        ).grid(row=0, column=4, padx=(1, 6))
+
+        ctk.CTkButton(row, text="✎", width=30, command=lambda idx=index: self.edit(idx)).grid(
+            row=0, column=5, padx=2, pady=4)
+        ctk.CTkButton(row, text="⤒", width=30, command=lambda idx=index: self.move_to(idx, 0)).grid(
+            row=0, column=6, padx=2)
+        ctk.CTkButton(row, text="▲", width=30, command=lambda idx=index: self.move(idx, -1)).grid(
+            row=0, column=7, padx=2)
+        ctk.CTkButton(row, text="▼", width=30, command=lambda idx=index: self.move(idx, 1)).grid(
+            row=0, column=8, padx=2)
+        ctk.CTkButton(
+            row, text="⤓", width=30,
+            command=lambda idx=index: self.move_to(idx, len(self.steps) - 1),
+        ).grid(row=0, column=9, padx=2)
+        ctk.CTkButton(
+            row, text="✕", width=30, fg_color="#a13c3c", hover_color="#7d2e2e",
+            command=lambda idx=index: self.delete(idx),
+        ).grid(row=0, column=10, padx=(2, 8))
+
+        return _StepRow(row, pos_var, toggle_btn, summary_label)
+
+    def update_row(self, index: int) -> None:
+        if index >= len(self.rows) or index >= len(self.steps):
+            self.refresh()
+            return
+        step = self.steps[index]
+        widgets = self.rows[index]
+        widgets.pos_var.set(str(index + 1))
+        widgets.toggle_btn.configure(
+            text="On" if step.enabled else "Off",
+            fg_color="#2f6f43" if step.enabled else "#5a5a5a",
+            hover_color="#27583a" if step.enabled else "#4a4a4a",
+        )
+        text, text_color = App._step_row_summary(step)
+        widgets.summary_label.configure(text=text, text_color=text_color)
+
+    def sync_positions(self) -> None:
+        for i, widgets in enumerate(self.rows):
+            if i < len(self.steps):
+                widgets.pos_var.set(str(i + 1))
+
+    def on_add(self, label: str, menu: ctk.CTkOptionMenu) -> None:
+        kind = None
+        for k, name in STEP_KINDS.items():
+            if name == label:
+                kind = k
+                break
+        menu.set("➕  Add step…")
+        if kind is None:
+            return
+        step = Step(kind=kind)
+        if kind in ("move", "ai_paste_macro", "image_paste"):
+            step.use_point = True
+        StepEditor(self.app, step, on_save=lambda s: self.append(s))
+
+    def append(self, step: Step) -> None:
+        self.steps.append(step)
+        if not self.rows:
+            self.refresh()
+        else:
+            index = len(self.steps) - 1
+            self.rows.append(self._create_row(index, step))
+
+    def edit(self, index: int) -> None:
+        step = self.steps[index]
+        StepEditor(self.app, step, on_save=lambda s, idx=index: self.replace(idx, s))
+
+    def replace(self, index: int, step: Step) -> None:
+        self.steps[index] = step
+        self.update_row(index)
+
+    def delete(self, index: int) -> None:
+        del self.steps[index]
+        self.refresh()
+
+    def move(self, index: int, delta: int) -> None:
+        new = index + delta
+        if 0 <= new < len(self.steps):
+            self.steps[index], self.steps[new] = self.steps[new], self.steps[index]
+            self.refresh()
+
+    def move_to(self, index: int, target: int) -> None:
+        if index == target or not (0 <= target < len(self.steps)):
+            return
+        step = self.steps.pop(index)
+        self.steps.insert(target, step)
+        self.refresh()
+
+    def move_to_position(self, index: int, value: str) -> None:
+        try:
+            target = int(float(value)) - 1
+        except (ValueError, TypeError):
+            self.sync_positions()
+            return
+        target = max(0, min(len(self.steps) - 1, target))
+        if target == index:
+            self.sync_positions()
+        else:
+            self.move_to(index, target)
+
+    def toggle(self, index: int) -> None:
+        self.steps[index].enabled = not self.steps[index].enabled
+        self.update_row(index)
 
 
 class App(ctk.CTk):
@@ -49,8 +246,10 @@ class App(ctk.CTk):
 
         # Workflow state
         self._steps: list[Step] = [Step.from_dict(d) for d in self.cfg.steps]
+        self._restart_steps: list[Step] = [Step.from_dict(d) for d in self.cfg.restart_steps]
         self._wf_stop = threading.Event()
         self._wf_thread: Optional[threading.Thread] = None
+        self._run_history: list[RunRecord] = self._load_history()
         self._log_boxes: list[ctk.CTkTextbox] = []
 
         # Test-tab state
@@ -65,10 +264,14 @@ class App(ctk.CTk):
         self.tabs.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         self.tab_run = self.tabs.add("Test")
         self.tab_workflow = self.tabs.add("Workflow")
+        self.tab_restart = self.tabs.add("Restart")
+        self.tab_history = self.tabs.add("History")
         self.tab_settings = self.tabs.add("Settings")
 
         self._build_run_tab()
         self._build_workflow_tab()
+        self._build_restart_tab()
+        self._build_history_tab()
         self._build_settings_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -196,7 +399,8 @@ class App(ctk.CTk):
         bar.grid_columnconfigure(6, weight=1)
 
         self.add_step_menu = ctk.CTkOptionMenu(
-            bar, values=list(STEP_KINDS.values()), command=self._on_add_step,
+            bar, values=list(STEP_KINDS.values()),
+            command=lambda label: self._wf_list.on_add(label, self.add_step_menu),
             width=170,
         )
         self.add_step_menu.set("➕  Add step…")
@@ -207,7 +411,10 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(bar, text="repeat").grid(row=0, column=3, padx=(12, 2))
         self.repeat_var = ctk.StringVar(value=str(self.cfg.workflow_repeat))
-        ctk.CTkEntry(bar, textvariable=self.repeat_var, width=48).grid(row=0, column=4, padx=2)
+        self.repeat_entry = ctk.CTkEntry(bar, textvariable=self.repeat_var, width=48)
+        self.repeat_entry.grid(row=0, column=4, padx=2)
+        self.repeat_entry.bind("<FocusOut>", lambda _e: self._persist_workflow_repeat())
+        self.repeat_entry.bind("<Return>", lambda _e: self._persist_workflow_repeat())
         ctk.CTkLabel(bar, text="×").grid(row=0, column=5, padx=(0, 8))
 
         ctk.CTkButton(bar, text="💾 Save", command=self._save_workflow, width=70).grid(
@@ -225,6 +432,16 @@ class App(ctk.CTk):
         self.steps_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         self.steps_frame.grid_columnconfigure(0, weight=1)
 
+        self._wf_list = _StepListController(
+            self, self.steps_frame, self._steps,
+            empty_text=(
+                "No steps yet. Use “Add step…” to build your sequence:\n"
+                "e.g. Click → Wait → Capture + ask AI → Type AI answer → Press Enter."
+            ),
+            on_run_from=self._run_workflow_from,
+            on_run_only=self._run_only_step,
+        )
+
         # --- Workflow log ---
         logf = ctk.CTkFrame(tab)
         logf.grid(row=2, column=0, sticky="ew", padx=4, pady=(6, 4))
@@ -237,176 +454,264 @@ class App(ctk.CTk):
         wf_log.configure(state="disabled")
         self._log_boxes.append(wf_log)
 
-        self._refresh_step_list()
+        self._wf_list.refresh()
 
-    def _refresh_step_list(self) -> None:
-        for child in self.steps_frame.winfo_children():
-            child.destroy()
+    def _build_restart_tab(self) -> None:
+        tab = self.tab_restart
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
 
-        if not self._steps:
-            ctk.CTkLabel(
-                self.steps_frame,
-                text="No steps yet. Use “Add step…” to build your sequence:\n"
-                     "e.g. Click → Wait → Capture + ask AI → Type AI answer → Press Enter.",
-                text_color="gray", justify="left",
-            ).grid(row=0, column=0, sticky="w", padx=12, pady=20)
-            return
+        bar = ctk.CTkFrame(tab)
+        bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 6))
+        bar.grid_columnconfigure(4, weight=1)
 
-        for i, step in enumerate(self._steps):
-            row = ctk.CTkFrame(self.steps_frame)
-            row.grid(row=i, column=0, sticky="ew", padx=4, pady=3)
-            row.grid_columnconfigure(2, weight=1)
+        self.restart_add_menu = ctk.CTkOptionMenu(
+            bar, values=list(STEP_KINDS.values()),
+            command=lambda label: self._restart_list.on_add(label, self.restart_add_menu),
+            width=170,
+        )
+        self.restart_add_menu.set("➕  Add step…")
+        self.restart_add_menu.grid(row=0, column=0, padx=(8, 6), pady=8)
 
-            pos_var = ctk.StringVar(value=str(i + 1))
-            pos_entry = ctk.CTkEntry(row, width=42, textvariable=pos_var, justify="center")
-            pos_entry.grid(row=0, column=0, padx=(8, 2), pady=6)
-            pos_entry.bind(
-                "<Return>",
-                lambda _e, idx=i, v=pos_var: self._move_step_to_position(idx, v.get()),
-            )
-            pos_entry.bind("<FocusIn>", lambda _e, w=pos_entry: w.select_range(0, "end"))
+        self.restart_run_btn = ctk.CTkButton(
+            bar, text="▶  Run restart", command=self._run_restart_workflow, width=130,
+        )
+        self.restart_run_btn.grid(row=0, column=1, padx=4, pady=8)
 
-            ctk.CTkButton(
-                row,
-                text="On" if step.enabled else "Off",
-                width=44,
-                fg_color="#2f6f43" if step.enabled else "#5a5a5a",
-                hover_color="#27583a" if step.enabled else "#4a4a4a",
-                command=lambda idx=i: self._toggle_step(idx),
-            ).grid(row=0, column=1, padx=2)
+        ctk.CTkButton(bar, text="💾 Save", command=self._save_restart_workflow, width=70).grid(
+            row=0, column=2, padx=(4, 4), pady=8,
+        )
 
-            color = None if step.enabled else "gray"
-            text = step.summary() if step.enabled else f"⊘ {step.summary()}  (disabled)"
-            ctk.CTkLabel(
-                row, text=text, anchor="w", text_color=color,
-                font=("Segoe UI", 12),
-            ).grid(row=0, column=2, sticky="ew", padx=6)
+        ctk.CTkLabel(
+            bar,
+            text="Runs when an AI check fails with “Run restart workflow” enabled, "
+                 "then the main workflow starts again from step 1 (unlimited retries).",
+            text_color="gray", wraplength=520, justify="left",
+        ).grid(row=0, column=3, columnspan=2, sticky="w", padx=(12, 8), pady=8)
 
-            ctk.CTkButton(
-                row, text="▶ here", width=56, fg_color="#2f6f43", hover_color="#27583a",
-                command=lambda idx=i: self._run_workflow_from(idx),
-            ).grid(row=0, column=3, padx=(2, 1), pady=4)
-            ctk.CTkButton(
-                row, text="▶ one", width=52, fg_color="#2f6f43", hover_color="#27583a",
-                command=lambda idx=i: self._run_only_step(idx),
-            ).grid(row=0, column=4, padx=(1, 6))
+        self.restart_steps_frame = ctk.CTkScrollableFrame(
+            tab,
+            label_text="Restart steps  (recovery actions before the main workflow loops again)",
+        )
+        self.restart_steps_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self.restart_steps_frame.grid_columnconfigure(0, weight=1)
 
-            ctk.CTkButton(row, text="✎", width=30, command=lambda idx=i: self._edit_step(idx)).grid(
-                row=0, column=5, padx=2, pady=4)
-            ctk.CTkButton(row, text="⤒", width=30, command=lambda idx=i: self._move_step_to(idx, 0)).grid(
-                row=0, column=6, padx=2)
-            ctk.CTkButton(row, text="▲", width=30, command=lambda idx=i: self._move_step(idx, -1)).grid(
-                row=0, column=7, padx=2)
-            ctk.CTkButton(row, text="▼", width=30, command=lambda idx=i: self._move_step(idx, 1)).grid(
-                row=0, column=8, padx=2)
-            ctk.CTkButton(row, text="⤓", width=30, command=lambda idx=i: self._move_step_to(idx, len(self._steps) - 1)).grid(
-                row=0, column=9, padx=2)
-            ctk.CTkButton(
-                row, text="✕", width=30, fg_color="#a13c3c", hover_color="#7d2e2e",
-                command=lambda idx=i: self._delete_step(idx),
-            ).grid(row=0, column=10, padx=(2, 8))
+        self._restart_list = _StepListController(
+            self, self.restart_steps_frame, self._restart_steps,
+            empty_text=(
+                "No restart steps yet. Add steps here to recover when an AI check fails\n"
+                "(e.g. close a dialog, navigate back, click Retry)."
+            ),
+            on_run_from=self._run_restart_from,
+            on_run_only=self._run_restart_only,
+        )
+        self._restart_list.refresh()
 
-    # -- step list mutations ------------------------------------------
-    def _kind_from_label(self, label: str) -> Optional[str]:
-        for kind, name in STEP_KINDS.items():
-            if name == label:
-                return kind
-        return None
+    @staticmethod
+    def _step_row_summary(step: Step) -> tuple[str, str | tuple[str, str]]:
+        if step.enabled:
+            return step.summary(), ctk.ThemeManager.theme["CTkLabel"]["text_color"]
+        return f"⊘ {step.summary()}  (disabled)", "gray"
 
-    def _on_add_step(self, label: str) -> None:
-        kind = self._kind_from_label(label)
-        self.add_step_menu.set("➕  Add step…")
-        if kind is None:
-            return
-        step = Step(kind=kind)
-        if kind in ("move", "ai_paste_macro", "image_paste"):
-            step.use_point = True
-        StepEditor(self, step, on_save=lambda s: self._append_step(s))
-
-    def _append_step(self, step: Step) -> None:
-        self._steps.append(step)
-        self._refresh_step_list()
-
-    def _edit_step(self, index: int) -> None:
-        step = self._steps[index]
-        StepEditor(self, step, on_save=lambda s, idx=index: self._replace_step(idx, s))
-
-    def _replace_step(self, index: int, step: Step) -> None:
-        self._steps[index] = step
-        self._refresh_step_list()
-
-    def _delete_step(self, index: int) -> None:
-        del self._steps[index]
-        self._refresh_step_list()
-
-    def _move_step(self, index: int, delta: int) -> None:
-        new = index + delta
-        if 0 <= new < len(self._steps):
-            self._steps[index], self._steps[new] = self._steps[new], self._steps[index]
-            self._refresh_step_list()
-
-    def _move_step_to(self, index: int, target: int) -> None:
-        if index == target or not (0 <= target < len(self._steps)):
-            return
-        step = self._steps.pop(index)
-        self._steps.insert(target, step)
-        self._refresh_step_list()
-
-    def _move_step_to_position(self, index: int, value: str) -> None:
-        """Move the step at ``index`` to the 1-based position typed by the user."""
+    # ------------------------------------------------------------------
+    # History tab
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _load_history() -> list[RunRecord]:
         try:
-            target = int(float(value)) - 1
-        except (ValueError, TypeError):
-            self._refresh_step_list()  # reset the box to its real value
-            return
-        target = max(0, min(len(self._steps) - 1, target))
-        if target == index:
-            self._refresh_step_list()
-        else:
-            self._move_step_to(index, target)
+            if HISTORY_PATH.exists():
+                import json as _json
+                raw = _json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+                return [RunRecord(**d) for d in raw if isinstance(d, dict)]
+        except Exception:  # noqa: BLE001
+            pass
+        return []
 
-    def _toggle_step(self, index: int) -> None:
-        self._steps[index].enabled = not self._steps[index].enabled
-        self._refresh_step_list()
+    def _save_history(self) -> None:
+        try:
+            import json as _json
+            HISTORY_PATH.write_text(
+                _json.dumps([r.as_dict() for r in self._run_history], indent=2),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _build_history_tab(self) -> None:
+        tab = self.tab_history
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+
+        # --- Toolbar ---
+        bar = ctk.CTkFrame(tab)
+        bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 6))
+        bar.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(bar, text="Workflow run history",
+                     font=("Segoe UI", 13, "bold")).grid(
+            row=0, column=0, sticky="w", padx=12, pady=8)
+        ctk.CTkButton(bar, text="🗑 Clear", width=80,
+                      command=self._clear_history).grid(
+            row=0, column=3, padx=(4, 8), pady=8)
+
+        # --- Header row ---
+        hdr = ctk.CTkFrame(tab)
+        hdr.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 0))
+        for col, (label, w) in enumerate([
+            ("#", 36), ("Started", 140), ("Type", 170),
+            ("Steps", 52), ("Pass", 70), ("Restarts", 64),
+            ("Duration", 76), ("Status", 80),
+        ]):
+            ctk.CTkLabel(hdr, text=label, font=("Segoe UI", 11, "bold"),
+                         width=w, anchor="w").grid(
+                row=0, column=col, padx=(6 if col == 0 else 2, 2),
+                pady=4, sticky="w")
+
+        # --- Scrollable body ---
+        self.history_frame = ctk.CTkScrollableFrame(tab, label_text="")
+        self.history_frame.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        self._history_col_widths = [36, 140, 170, 52, 70, 64, 76, 80]
+        self._history_row_count = 0
+
+        for record in self._run_history:
+            self._render_history_row(record)
+
+    _STATUS_COLOR = {
+        "Finished": "#2f6f43",
+        "Stopped":  "#7a6000",
+        "Failed":   "#a13c3c",
+    }
+
+    def _render_history_row(self, record: workflow.RunRecord) -> None:
+        i = self._history_row_count
+        self._history_row_count += 1
+        bg = "#1e1e1e" if i % 2 == 0 else "#252525"
+        row = ctk.CTkFrame(self.history_frame, fg_color=bg)
+        row.grid(row=i, column=0, sticky="ew", padx=0, pady=0)
+
+        duration_str = (
+            f"{int(record.duration_s // 60)}m {int(record.duration_s % 60)}s"
+            if record.duration_s >= 60 else f"{record.duration_s:.1f}s"
+        )
+        status_color = self._STATUS_COLOR.get(record.status, "gray")
+        pass_label = (f"{record.pass_number}/{record.total_passes}"
+                      if record.total_passes > 1 else "1")
+        values = [
+            str(i + 1),
+            record.started_at,
+            record.run_type,
+            str(record.total_steps),
+            pass_label,
+            str(record.restarts),
+            duration_str,
+            record.status,
+        ]
+        for col, (val, w) in enumerate(zip(values, self._history_col_widths)):
+            color = status_color if col == 8 else ctk.ThemeManager.theme["CTkLabel"]["text_color"]
+            font = ("Segoe UI", 11, "bold") if col == 8 else ("Segoe UI", 11)
+            ctk.CTkLabel(row, text=val, width=w, anchor="w",
+                         font=font, text_color=color).grid(
+                row=0, column=col,
+                padx=(6 if col == 0 else 2, 2), pady=3, sticky="w")
+
+        if record.fail_reason:
+            ctk.CTkLabel(row, text=f"  ⚠ {record.fail_reason}",
+                         text_color="#c47a00", font=("Segoe UI", 10),
+                         anchor="w").grid(
+                row=1, column=0, columnspan=8,
+                sticky="ew", padx=8, pady=(0, 3))
+
+    def _add_history_record(self, record: workflow.RunRecord) -> None:
+        self._run_history.append(record)
+        self._render_history_row(record)
+        self._save_history()
+
+    def _clear_history(self) -> None:
+        self._run_history.clear()
+        self._history_row_count = 0
+        for child in self.history_frame.winfo_children():
+            child.destroy()
+        self._save_history()
 
     # -- run / stop ----------------------------------------------------
-    def _save_workflow(self) -> None:
-        self.cfg.steps = [s.as_dict() for s in self._steps]
+    def _collect_workflow_repeat(self) -> None:
         try:
             self.cfg.workflow_repeat = max(1, int(self.repeat_var.get()))
         except ValueError:
             self.cfg.workflow_repeat = 1
+
+    def _persist_workflow_repeat(self) -> None:
+        """Save the repeat count to config.json when the user edits it."""
+        self._collect_workflow_repeat()
+        try:
+            self.cfg.save()
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Could not save repeat count: {exc}")
+
+    def _save_workflow(self) -> None:
+        self.cfg.steps = [s.as_dict() for s in self._steps]
+        self._collect_workflow_repeat()
         self._save_settings()
         self.log(f"Workflow saved ({len(self._steps)} steps).")
 
-    def _start_run(self, steps: list, repeat: int, header: str,
-                   start_number: int = 1) -> None:
+    def _save_restart_workflow(self) -> None:
+        self.cfg.restart_steps = [s.as_dict() for s in self._restart_steps]
+        self._save_settings()
+        self.log(f"Restart workflow saved ({len(self._restart_steps)} steps).")
+
+    def _start_run(
+        self,
+        steps: list,
+        repeat: int,
+        header: str,
+        start_number: int = 1,
+        *,
+        start_at: int = 0,
+        end_at: Optional[int] = None,
+        sub_workflow: bool = False,
+        main_steps: Optional[list] = None,
+    ) -> None:
         """Shared launcher for full / from-here / single-step runs."""
         if self._wf_thread and self._wf_thread.is_alive():
             self.log("Workflow already running.")
             return
-        if not any(s.enabled for s in steps):
+        if end_at is None:
+            end_at = len(steps)
+        run_slice = steps[start_at:end_at]
+        if not any(s.enabled for s in run_slice):
             self.log("No enabled steps to run.")
             return
         self._collect_runtime_settings()
+        self._collect_workflow_repeat()
         self._wf_stop.clear()
         self.wf_run_btn.configure(state="disabled")
         self.log(header)
         if any(s.enabled and s.kind in ("capture_ai", "ai_find_click",
-                                        "remember_screen", "image_paste")
-               for s in steps):
+                                        "remember_screen", "image_paste", "ai_assert")
+               for s in run_slice):
             self.log("Screen captures are local to this PC (invisible to an AnyDesk "
                      "remote); only clicks/keys are sent.")
 
         ctx = RunContext(
             cfg=self.cfg, log=self.log,
             on_image=self._show_preview, on_answer=self._set_answer,
+            restart_steps=self._restart_steps,
+            main_steps=main_steps if main_steps is not None else self._steps,
+            on_pass_complete=lambda r: self.after(0, lambda rec=r: self._add_history_record(rec)),
         )
-        runner = WorkflowRunner(steps, ctx, self._wf_stop)
+        runner = WorkflowRunner(steps, ctx, self._wf_stop, sub_workflow=sub_workflow)
+        run_type = header.split("…")[0].strip()
+        total_enabled = sum(1 for s in run_slice if s.enabled)
 
         def _run() -> None:
             try:
-                runner.run(repeat=repeat, start_number=start_number)
+                runner.run(
+                    repeat=repeat,
+                    start_number=start_number,
+                    start_at=start_at,
+                    end_at=end_at,
+                    run_type=run_type,
+                    total_steps=total_enabled,
+                )
             finally:
                 self.after(0, lambda: self.wf_run_btn.configure(state="normal"))
 
@@ -414,33 +719,62 @@ class App(ctk.CTk):
         self._wf_thread.start()
 
     def _run_workflow(self) -> None:
-        try:
-            repeat = max(1, int(self.repeat_var.get()))
-        except ValueError:
-            repeat = 1
-        self.cfg.workflow_repeat = repeat
+        self._collect_workflow_repeat()
+        repeat = self.cfg.workflow_repeat
         n = sum(s.enabled for s in self._steps)
-        self._start_run(self._steps, repeat,
-                        f"Starting workflow ({n} steps × {repeat})…", start_number=1)
+        self._persist_workflow_repeat()
+        self._start_run(
+            self._steps, repeat,
+            f"Starting workflow ({n} steps × {repeat})…",
+            start_number=1, start_at=0,
+        )
 
     def _run_workflow_from(self, index: int) -> None:
         if not (0 <= index < len(self._steps)):
             return
-        steps = self._steps[index:]
-        n = sum(s.enabled for s in steps)
-        self._start_run(steps, 1,
-                        f"Starting from step {index + 1} ({n} steps)…",
-                        start_number=index + 1)
+        n = sum(s.enabled for s in self._steps[index:])
+        self._start_run(
+            self._steps, 1,
+            f"Starting from step {index + 1} ({n} steps)…",
+            start_number=index + 1, start_at=index,
+        )
 
     def _run_only_step(self, index: int) -> None:
         if not (0 <= index < len(self._steps)):
             return
         step = self._steps[index]
-        # Force-run this one step even if its checkbox is unticked.
+        run_steps = [Step.from_dict(s.as_dict()) for s in self._steps]
+        run_steps[index] = Step.from_dict({**step.as_dict(), "enabled": True})
+        self._start_run(
+            run_steps, 1,
+            f"Running only step {index + 1}: {step.summary()}",
+            start_number=index + 1, start_at=index, end_at=index + 1,
+            main_steps=run_steps,
+        )
+
+    def _run_restart_workflow(self) -> None:
+        n = sum(s.enabled for s in self._restart_steps)
+        self._start_run(self._restart_steps, 1,
+                        f"Starting restart workflow ({n} steps)…", start_number=1,
+                        sub_workflow=True)
+
+    def _run_restart_from(self, index: int) -> None:
+        if not (0 <= index < len(self._restart_steps)):
+            return
+        steps = self._restart_steps[index:]
+        n = sum(s.enabled for s in steps)
+        self._start_run(steps, 1,
+                        f"Starting restart from step {index + 1} ({n} steps)…",
+                        start_number=index + 1, sub_workflow=True)
+
+    def _run_restart_only(self, index: int) -> None:
+        if not (0 <= index < len(self._restart_steps)):
+            return
+        step = self._restart_steps[index]
         run_step = Step.from_dict({**step.as_dict(), "enabled": True})
         self._start_run([run_step], 1,
-                        f"Running only step {index + 1}: {step.summary()}",
-                        start_number=index + 1)
+                        f"Running only restart step {index + 1}: {step.summary()}",
+                        start_number=index + 1, sub_workflow=True)
 
     def _stop_workflow(self) -> None:
         if self._wf_thread and self._wf_thread.is_alive():
@@ -872,8 +1206,10 @@ class App(ctk.CTk):
 
     def _save_settings(self) -> None:
         self._collect_runtime_settings()
+        self._collect_workflow_repeat()
         self.cfg.region.full_screen = self.full_screen_var.get()
         self.cfg.steps = [s.as_dict() for s in self._steps]
+        self.cfg.restart_steps = [s.as_dict() for s in self._restart_steps]
         try:
             self.cfg.save()
             self.log("Settings saved to config.json.")
@@ -888,10 +1224,8 @@ class App(ctk.CTk):
             self._collect_runtime_settings()
             self.cfg.region.full_screen = self.full_screen_var.get()
             self.cfg.steps = [s.as_dict() for s in self._steps]
-            try:
-                self.cfg.workflow_repeat = max(1, int(self.repeat_var.get()))
-            except ValueError:
-                self.cfg.workflow_repeat = 1
+            self.cfg.restart_steps = [s.as_dict() for s in self._restart_steps]
+            self._collect_workflow_repeat()
             self.cfg.save()
         except Exception:  # noqa: BLE001
             pass
@@ -1103,6 +1437,19 @@ class StepEditor(ctk.CTkToplevel):
                 self.body,
                 text="Re-checks this many times (waiting ~1s between) before giving "
                      "up — useful while a page is still loading.",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+            self.run_restart_var = ctk.BooleanVar(value=self.step.run_restart)
+            ctk.CTkCheckBox(
+                self.body,
+                text="When check fails, run restart workflow then restart main workflow from step 1",
+                variable=self.run_restart_var,
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+            ctk.CTkLabel(
+                self.body,
+                text="Build the recovery steps on the Restart tab. If disabled, a failed "
+                     "check stops the workflow as before.",
                 text_color="gray", wraplength=380, justify="left",
             ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
 
@@ -1499,6 +1846,7 @@ class StepEditor(ctk.CTkToplevel):
         elif kind == "ai_assert":
             s.prompt = self.prompt_box.get("1.0", "end").strip()
             s.attempts = max(1, self._to_int(self.attempts_entry.get(), 1))
+            s.run_restart = self.run_restart_var.get()
         elif kind == "conditional_click":
             s.read_clipboard = self.read_clipboard_var.get()
             s.var = self.var_entry.get().strip() or "value"

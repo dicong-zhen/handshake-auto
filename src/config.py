@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover - dotenv is optional at runtime
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
+HISTORY_PATH = PROJECT_ROOT / "history.json"
 
 DEFAULT_PROMPT = (
     "You are looking at a screenshot of a Windows screen. "
@@ -100,6 +101,8 @@ class AppConfig:
     # Workflow: ordered list of step dicts (see workflow.Step) + repeat count.
     steps: list = field(default_factory=list)
     workflow_repeat: int = 1
+    # Steps run when an AI check fails with "run restart workflow" enabled.
+    restart_steps: list = field(default_factory=list)
 
     # ---- persistence -------------------------------------------------
     @classmethod
@@ -131,6 +134,10 @@ class AppConfig:
                 setattr(self, key, data[key])
         if "steps" in data and isinstance(data["steps"], list):
             self.steps = data["steps"]
+        if "workflow_repeat" in data and isinstance(data["workflow_repeat"], int):
+            self.workflow_repeat = max(1, data["workflow_repeat"])
+        if "restart_steps" in data and isinstance(data["restart_steps"], list):
+            self.restart_steps = data["restart_steps"]
         if "api_keys" in data and isinstance(data["api_keys"], dict):
             self.api_keys = data["api_keys"]
         if "models" in data and isinstance(data["models"], dict):
@@ -174,5 +181,6 @@ class AppConfig:
             "disable_failsafe": self.disable_failsafe,
             "steps": self.steps,
             "workflow_repeat": self.workflow_repeat,
+            "restart_steps": self.restart_steps,
         }
         CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")

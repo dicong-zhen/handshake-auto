@@ -12,6 +12,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass, asdict, field
+from datetime import datetime
 from typing import Callable, Optional
 
 from PIL import Image
@@ -96,6 +97,9 @@ class Step:
     min_delay: float = 0.5
     max_delay: float = 1.5
 
+    # ai_assert: when the check fails, run the restart workflow then loop the main workflow
+    run_restart: bool = False
+
     def as_dict(self) -> dict:
         return asdict(self)
 
@@ -131,7 +135,8 @@ class Step:
             return f"AI find &{btn} {kind}: \"{desc}\""
         if self.kind == "ai_assert":
             desc = (self.prompt[:34] + "…") if len(self.prompt) > 34 else (self.prompt or "(condition)")
-            return f"AI check (stop if fails): \"{desc}\""
+            extra = " → restart main" if self.run_restart else ""
+            return f"AI check (stop if fails): \"{desc}\"{extra}"
         if self.kind == "conditional_click":
             src = "clipboard" if self.read_clipboard else f"[{self.var}]"
             n = len(self.rules)
@@ -176,47 +181,181 @@ class RunContext:
     on_answer: Callable[[str], None] = lambda text: None
     last_answer: str = ""
     memory: dict = field(default_factory=dict)
+    restart_steps: list = field(default_factory=list)
+    main_steps: list = field(default_factory=list)
+    on_pass_complete: Callable[["RunRecord"], None] = lambda r: None
+
+
+@dataclass
+class RunRecord:
+    """One completed workflow pass (single iteration), stored in history."""
+    started_at: str       # local timestamp when this pass started
+    run_type: str         # "Full workflow", "From step N", "Single step N"
+    total_steps: int      # number of enabled steps in this pass
+    pass_number: int      # 1-based index within the repeat run
+    total_passes: int     # total requested repeats for the run
+    restarts: int         # restart-workflow cycles triggered in this pass
+    duration_s: float     # wall-clock seconds for this pass
+    status: str           # "Finished" | "Stopped" | "Failed"
+    fail_reason: str = "" # brief reason when status == "Failed"
+
+    def as_dict(self) -> dict:
+        return asdict(self)
 
 
 class WorkflowRunner:
     """Executes a list of steps with optional human-like pacing."""
 
-    def __init__(self, steps: list[Step], ctx: RunContext, stop_event: threading.Event) -> None:
+    def __init__(
+        self,
+        steps: list[Step],
+        ctx: RunContext,
+        stop_event: threading.Event,
+        *,
+        sub_workflow: bool = False,
+    ) -> None:
         self.steps = steps
         self.ctx = ctx
         self.stop = stop_event
+        self._in_restart = False
+        self._sub_workflow = sub_workflow
+        # populated after run() returns
+        self.passes_completed: int = 0
+        self.restarts: int = 0
+        self.final_status: str = "Finished"   # Finished | Stopped | Failed
+        self.fail_reason: str = ""
 
-    def run(self, repeat: int = 1, start_number: int = 1) -> None:
-        cfg = self.ctx.cfg
+    def _steps_to_run(self) -> list[Step]:
+        if self._sub_workflow:
+            return self.steps
+        return self.ctx.main_steps or self.steps
+
+    def run(
+        self,
+        repeat: int = 1,
+        start_number: int = 1,
+        start_at: int = 0,
+        end_at: Optional[int] = None,
+        run_type: str = "Workflow run",
+        total_steps: int = 0,
+    ) -> None:
+        all_steps = self._steps_to_run()
+        if end_at is None:
+            end_at = len(all_steps)
+        run_start_at = max(0, min(start_at, len(all_steps)))
+        run_end_at = max(run_start_at, min(end_at, len(all_steps)))
         loops = repeat if repeat > 0 else 1
         for i in range(loops):
             if self.stop.is_set():
+                self.final_status = "Stopped"
                 break
             if loops > 1:
                 self.ctx.log(f"--- Pass {i + 1} of {loops} ---")
-            for index, step in enumerate(self.steps, start=start_number):
+            log_start = start_number
+            pass_restarts = 0
+            pass_start = time.monotonic()
+            pass_started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            pass_status = "Finished"
+            pass_fail_reason = ""
+            while True:
                 if self.stop.is_set():
                     self.ctx.log("Stopped.")
+                    self.final_status = "Stopped"
+                    pass_status = "Stopped"
+                    self._emit_pass(run_type, total_steps, i + 1, loops,
+                                    pass_restarts, pass_start, pass_started_at,
+                                    pass_status, pass_fail_reason)
                     return
-                if not step.enabled:
+                restart_main = False
+                for offset, step in enumerate(all_steps[run_start_at:run_end_at]):
+                    index = log_start + offset
+                    if self.stop.is_set():
+                        self.ctx.log("Stopped.")
+                        self.final_status = "Stopped"
+                        pass_status = "Stopped"
+                        self._emit_pass(run_type, total_steps, i + 1, loops,
+                                        pass_restarts, pass_start, pass_started_at,
+                                        pass_status, pass_fail_reason)
+                        return
+                    if not step.enabled:
+                        continue
+                    self.ctx.log(f"Step {index}: {step.summary()}")
+                    try:
+                        outcome = self._exec(step)
+                    except automation.FailSafeException:
+                        self.ctx.log("Fail-safe triggered (mouse in corner). Stopping.")
+                        self.stop.set()
+                        self.final_status = "Stopped"
+                        self.fail_reason = "Fail-safe triggered"
+                        pass_status = "Stopped"
+                        pass_fail_reason = "Fail-safe triggered"
+                        self._emit_pass(run_type, total_steps, i + 1, loops,
+                                        pass_restarts, pass_start, pass_started_at,
+                                        pass_status, pass_fail_reason)
+                        return
+                    except ai_client.AIError as exc:
+                        self.ctx.log(f"  AI error: {exc}")
+                        outcome = None
+                    except Exception as exc:  # noqa: BLE001
+                        self.ctx.log(f"  Error: {exc}")
+                        outcome = None
+                    if outcome == "stop":
+                        self.final_status = "Failed"
+                        pass_status = "Failed"
+                        pass_fail_reason = self.fail_reason
+                        self._emit_pass(run_type, total_steps, i + 1, loops,
+                                        pass_restarts, pass_start, pass_started_at,
+                                        pass_status, pass_fail_reason)
+                        return
+                    if outcome == "restart_main":
+                        restart_main = True
+                        break
+                    self._human_pause()
+                if restart_main and not self._sub_workflow:
+                    self.restarts += 1
+                    pass_restarts += 1
+                    run_start_at = 0
+                    run_end_at = len(all_steps)
+                    log_start = 1
+                    self.ctx.log("--- Restarting main workflow from step 1 ---")
                     continue
-                self.ctx.log(f"Step {index}: {step.summary()}")
-                try:
-                    self._exec(step)
-                except automation.FailSafeException:
-                    self.ctx.log("Fail-safe triggered (mouse in corner). Stopping.")
-                    self.stop.set()
-                    return
-                except ai_client.AIError as exc:
-                    self.ctx.log(f"  AI error: {exc}")
-                except Exception as exc:  # noqa: BLE001
-                    self.ctx.log(f"  Error: {exc}")
-                self._human_pause()
+                break
+            self.passes_completed += 1
+            self._emit_pass(run_type, total_steps, i + 1, loops,
+                            pass_restarts, pass_start, pass_started_at,
+                            pass_status, pass_fail_reason)
         if not self.stop.is_set():
             self.ctx.log("Workflow finished.")
 
+    def _emit_pass(
+        self,
+        run_type: str,
+        total_steps: int,
+        pass_number: int,
+        total_passes: int,
+        restarts: int,
+        pass_start: float,
+        started_at: str,
+        status: str,
+        fail_reason: str,
+    ) -> None:
+        if self._sub_workflow:
+            return
+        record = RunRecord(
+            started_at=started_at,
+            run_type=run_type,
+            total_steps=total_steps,
+            pass_number=pass_number,
+            total_passes=total_passes,
+            restarts=restarts,
+            duration_s=round(time.monotonic() - pass_start, 1),
+            status=status,
+            fail_reason=fail_reason,
+        )
+        self.ctx.on_pass_complete(record)
+
     # -- per-step execution -------------------------------------------
-    def _exec(self, step: Step) -> None:
+    def _exec(self, step: Step) -> Optional[str]:
         cfg = self.ctx.cfg
         human = cfg.humanize
         point = (step.x, step.y)
@@ -296,7 +435,7 @@ class WorkflowRunner:
             met, reason = None, ""
             for attempt in range(1, attempts + 1):
                 if self.stop.is_set():
-                    return
+                    return None
                 image = screen.capture(cfg.region)
                 self.ctx.on_image(image)
                 self.ctx.log(f"  Checking (attempt {attempt}/{attempts}): \"{cond}\"…")
@@ -313,10 +452,21 @@ class WorkflowRunner:
                     self._sleep(1.0)
             if met:
                 self.ctx.log(f"  ✓ Condition met. {reason}".rstrip())
-            else:
-                why = reason or ("could not parse AI reply" if met is None else "")
-                self.ctx.log(f"  ✗ Condition NOT met — stopping workflow. {why}".rstrip())
-                self.stop.set()
+                return None
+            why = reason or ("could not parse AI reply" if met is None else "")
+            self.ctx.log(f"  ✗ Condition NOT met. {why}".rstrip())
+            restart_steps = self.ctx.restart_steps
+            if (step.run_restart and not self._sub_workflow and not self._in_restart
+                    and restart_steps and any(s.enabled for s in restart_steps)):
+                self.ctx.log("  Running restart workflow, then restarting main workflow…")
+                self._run_restart_workflow(restart_steps)
+                if self.stop.is_set():
+                    return "stop"
+                return "restart_main"
+            self.ctx.log("  Stopping workflow.")
+            self.stop.set()
+            self.fail_reason = f"AI check failed: {step.prompt[:60]}"
+            return "stop"
 
         elif step.kind == "conditional_click":
             if step.read_clipboard:
@@ -522,6 +672,32 @@ class WorkflowRunner:
 
         elif step.kind == "wait":
             self._sleep(random.uniform(step.min_delay, step.max_delay))
+
+        return None
+
+    def _run_restart_workflow(self, steps: list[Step]) -> None:
+        """Run the recovery workflow once (no nested restart-on-fail)."""
+        self._in_restart = True
+        try:
+            for index, step in enumerate(steps, start=1):
+                if self.stop.is_set():
+                    return
+                if not step.enabled:
+                    continue
+                self.ctx.log(f"  Restart step {index}: {step.summary()}")
+                try:
+                    self._exec(step)
+                except automation.FailSafeException:
+                    self.ctx.log("Fail-safe triggered (mouse in corner). Stopping.")
+                    self.stop.set()
+                    return
+                except ai_client.AIError as exc:
+                    self.ctx.log(f"  AI error: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.log(f"  Error: {exc}")
+                self._human_pause()
+        finally:
+            self._in_restart = False
 
     # -- pacing --------------------------------------------------------
     def _human_pause(self) -> None:
