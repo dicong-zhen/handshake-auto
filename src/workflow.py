@@ -279,6 +279,15 @@ class WorkflowRunner:
                         return
                     if not step.enabled:
                         continue
+                    if not self._wait_for_screen():
+                        self.ctx.log("Stopped while waiting for screen.")
+                        self.stop.set()
+                        self.final_status = "Stopped"
+                        pass_status = "Stopped"
+                        self._emit_pass(run_type, total_steps, i + 1, loops,
+                                        pass_restarts, pass_start, pass_started_at,
+                                        pass_status, pass_fail_reason)
+                        return
                     self.ctx.log(f"Step {index}: {step.summary()}")
                     try:
                         outcome = self._exec(step)
@@ -563,6 +572,11 @@ class WorkflowRunner:
                 self.ctx.log("  Clicking at the cursor to focus the destination…")
                 automation.click(button=step.button, clicks=step.clicks, human=human)
             self._sleep(0.3)
+            # RDP clipboard sync can wipe the image while we focus the target;
+            # re-copy it right before pasting if it went missing.
+            if not automation.clipboard_has_image():
+                self.ctx.log("  Clipboard image was lost (RDP sync?); re-copying…")
+                automation.set_clipboard_image(crop)
             self.ctx.log("  Pasting image (Ctrl+V)…")
             automation.press_keys("ctrl+v", human=human)
             if step.keys.strip():
@@ -604,6 +618,9 @@ class WorkflowRunner:
             if step.clear_first:
                 automation.press_keys("ctrl+a", human=human)
                 self._sleep(0.1)
+            # Re-affirm the value right before pasting in case RDP clipboard
+            # sync overwrote it while we were focusing the target field.
+            automation.set_clipboard(value)
             self.ctx.log("  Pasting (Ctrl+V)…")
             automation.press_keys("ctrl+v", human=human)
             if step.keys.strip():
@@ -661,6 +678,8 @@ class WorkflowRunner:
                 if step.clear_first:
                     automation.press_keys("ctrl+a", human=human)
                     self._sleep(0.05)
+                # Re-affirm right before pasting (RDP clipboard sync guard).
+                automation.set_clipboard(value)
                 self.ctx.log(f"  Pasting [{step.var}] instantly (Ctrl+V).")
                 automation.press_keys("ctrl+v", human=human)
             elif step.use_point:
@@ -700,6 +719,25 @@ class WorkflowRunner:
             self._in_restart = False
 
     # -- pacing --------------------------------------------------------
+    def _wait_for_screen(self, poll_interval: float = 4.0) -> bool:
+        """Block until the primary screen is available again after RDP disconnect.
+
+        Returns True when the screen is available, False if the stop event fires
+        while waiting (caller should abort the run).
+        """
+        if screen.is_screen_available():
+            return True
+        self.ctx.log(
+            "⚠ Screen unavailable — RDP may be disconnected or minimised. "
+            "Pausing until the connection is restored…"
+        )
+        while not self.stop.is_set():
+            time.sleep(poll_interval)
+            if screen.is_screen_available():
+                self.ctx.log("✓ Screen is back. Resuming workflow…")
+                return True
+        return False
+
     def _human_pause(self) -> None:
         cfg = self.ctx.cfg
         if not cfg.humanize:

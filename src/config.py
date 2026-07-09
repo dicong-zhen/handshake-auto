@@ -97,12 +97,20 @@ class AppConfig:
     use_directinput: bool = True
     # Disable the corner-of-screen fail-safe (needed for minimized RDP / VPS).
     disable_failsafe: bool = False
+    # Pause RDP clipboard sync (kill rdpclip.exe) while a workflow runs so the
+    # client machine can't overwrite the clipboard mid-paste.  Restored after.
+    manage_rdp_clipboard: bool = True
 
     # Workflow: ordered list of step dicts (see workflow.Step) + repeat count.
     steps: list = field(default_factory=list)
     workflow_repeat: int = 1
     # Steps run when an AI check fails with "run restart workflow" enabled.
     restart_steps: list = field(default_factory=list)
+
+    # Multiple named workflows.  Each entry:
+    #   { "steps": [...], "restart_steps": [...], "repeat": N }
+    named_workflows: dict = field(default_factory=dict)
+    active_workflow: str = "Default"
 
     # ---- persistence -------------------------------------------------
     @classmethod
@@ -129,7 +137,7 @@ class AppConfig:
                     "loop_seconds", "appearance", "humanize", "humanize_min",
                     "humanize_max", "humanize_typos", "workflow_repeat",
                     "use_directinput", "disable_failsafe", "provider",
-                    "ai_locate_refine"):
+                    "ai_locate_refine", "manage_rdp_clipboard"):
             if key in data and data[key] not in (None, ""):
                 setattr(self, key, data[key])
         if "steps" in data and isinstance(data["steps"], list):
@@ -138,6 +146,30 @@ class AppConfig:
             self.workflow_repeat = max(1, data["workflow_repeat"])
         if "restart_steps" in data and isinstance(data["restart_steps"], list):
             self.restart_steps = data["restart_steps"]
+
+        # Named workflows ------------------------------------------------
+        if "named_workflows" in data and isinstance(data["named_workflows"], dict):
+            self.named_workflows = data["named_workflows"]
+        if "active_workflow" in data and isinstance(data["active_workflow"], str):
+            self.active_workflow = data["active_workflow"]
+
+        # Migrate old single-workflow config into named_workflows
+        if not self.named_workflows:
+            self.named_workflows["Default"] = {
+                "steps": self.steps,
+                "restart_steps": self.restart_steps,
+                "repeat": self.workflow_repeat,
+            }
+            self.active_workflow = "Default"
+
+        # Load the active workflow's data into the flat fields used by the rest
+        # of the app.  This lets existing code keep reading cfg.steps etc.
+        if self.active_workflow in self.named_workflows:
+            wf = self.named_workflows[self.active_workflow]
+            self.steps = wf.get("steps", self.steps)
+            self.restart_steps = wf.get("restart_steps", self.restart_steps)
+            self.workflow_repeat = max(1, wf.get("repeat", self.workflow_repeat))
+
         if "api_keys" in data and isinstance(data["api_keys"], dict):
             self.api_keys = data["api_keys"]
         if "models" in data and isinstance(data["models"], dict):
@@ -179,8 +211,19 @@ class AppConfig:
             "humanize_typos": self.humanize_typos,
             "use_directinput": self.use_directinput,
             "disable_failsafe": self.disable_failsafe,
+            "manage_rdp_clipboard": self.manage_rdp_clipboard,
+            # Keep flat steps/restart_steps in sync with the active named workflow
+            # so that old config readers can still fall back to them.
             "steps": self.steps,
             "workflow_repeat": self.workflow_repeat,
             "restart_steps": self.restart_steps,
+            "named_workflows": self.named_workflows,
+            "active_workflow": self.active_workflow,
         }
+        # Avoid duplicating large step lists: if named_workflows already stores
+        # the active workflow's steps we can keep the top-level list empty to
+        # prevent the config file from tripling in size.
+        if self.named_workflows:
+            data["steps"] = []
+            data["restart_steps"] = []
         CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")

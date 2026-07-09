@@ -15,6 +15,22 @@ from .config import Region
 CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
 
 
+def is_screen_available(min_width: int = 200, min_height: int = 200) -> bool:
+    """Return True if the primary monitor reports a usable resolution.
+
+    Returns False when an RDP session is disconnected / minimised and the
+    virtual display collapses to a very small or zero size.
+    """
+    try:
+        with mss.mss() as sct:
+            if len(sct.monitors) < 2:
+                return False
+            mon = sct.monitors[1]
+            return mon["width"] >= min_width and mon["height"] >= min_height
+    except Exception:
+        return False
+
+
 def capture(region: Region) -> Image.Image:
     """Capture the screen (full primary monitor or a region) as a PIL Image."""
     with mss.mss() as sct:

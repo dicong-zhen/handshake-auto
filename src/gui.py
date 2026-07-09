@@ -1,4 +1,10 @@
-"""CustomTkinter GUI for the screen-automation AI assistant."""
+"""Native-tkinter GUI for the screen-automation AI assistant.
+
+The UI uses a CustomTkinter-compatible shim (``ctk_compat``) built on classic
+tkinter/ttk widgets.  CustomTkinter draws everything on a tkinter.Canvas which
+does not paint reliably over remote-desktop sessions (RDP / AnyDesk); native
+widgets do, so the shim keeps the same API while rendering everywhere.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-import customtkinter as ctk
+from . import ctk_compat as ctk
 from PIL import Image
 
 from . import ai_client, automation, screen, workflow
@@ -76,8 +82,23 @@ class _StepListController:
             ).grid(row=0, column=0, sticky="w", padx=12, pady=20)
             return
 
-        for i, step in enumerate(self.steps):
-            self.rows.append(self._create_row(i, step))
+        # Build rows in small batches so the event loop stays responsive.
+        # With 100+ steps (≈900 widgets), a synchronous build freezes the UI.
+        self._build_batch(0)
+
+    _BATCH_SIZE = 12   # rows to create per event-loop tick
+
+    def _build_batch(self, start: int) -> None:
+        try:
+            if not self.frame.winfo_exists():
+                return
+            end = min(start + self._BATCH_SIZE, len(self.steps))
+            for i in range(start, end):
+                self.rows.append(self._create_row(i, self.steps[i]))
+            if end < len(self.steps):
+                self.frame.after(0, lambda s=end: self._build_batch(s))
+        except Exception:
+            pass
 
     def _create_row(self, index: int, step: Step) -> _StepRow:
         row = ctk.CTkFrame(self.frame)
@@ -121,20 +142,14 @@ class _StepListController:
 
         ctk.CTkButton(row, text="✎", width=30, command=lambda idx=index: self.edit(idx)).grid(
             row=0, column=5, padx=2, pady=4)
-        ctk.CTkButton(row, text="⤒", width=30, command=lambda idx=index: self.move_to(idx, 0)).grid(
-            row=0, column=6, padx=2)
         ctk.CTkButton(row, text="▲", width=30, command=lambda idx=index: self.move(idx, -1)).grid(
-            row=0, column=7, padx=2)
+            row=0, column=6, padx=2)
         ctk.CTkButton(row, text="▼", width=30, command=lambda idx=index: self.move(idx, 1)).grid(
-            row=0, column=8, padx=2)
-        ctk.CTkButton(
-            row, text="⤓", width=30,
-            command=lambda idx=index: self.move_to(idx, len(self.steps) - 1),
-        ).grid(row=0, column=9, padx=2)
+            row=0, column=7, padx=2)
         ctk.CTkButton(
             row, text="✕", width=30, fg_color="#a13c3c", hover_color="#7d2e2e",
             command=lambda idx=index: self.delete(idx),
-        ).grid(row=0, column=10, padx=(2, 8))
+        ).grid(row=0, column=8, padx=(2, 8))
 
         return _StepRow(row, pos_var, toggle_btn, summary_label)
 
@@ -158,7 +173,14 @@ class _StepListController:
             if i < len(self.steps):
                 widgets.pos_var.set(str(i + 1))
 
-    def on_add(self, label: str, menu: ctk.CTkOptionMenu) -> None:
+    def add_by_kind(self, kind: str) -> None:
+        """Add a new step of the given kind (called from the picker popup)."""
+        step = Step(kind=kind)
+        if kind in ("move", "ai_paste_macro", "image_paste"):
+            step.use_point = True
+        StepEditor(self.app, step, on_save=self.append)
+
+    def on_add(self, label: str, menu=None) -> None:
         kind = None
         for k, name in STEP_KINDS.items():
             if name == label:
@@ -222,13 +244,53 @@ class _StepListController:
         self.update_row(index)
 
 
+def _open_picker(
+    parent: ctk.CTk,
+    title: str,
+    options: list[str],
+    callback,
+    *,
+    current: str = "",
+    width: int = 300,
+    height: int = 380,
+) -> None:
+    """Open a floating list-picker that calls callback(selected) on pick.
+
+    Uses only CTkButton widgets — no tkinter.Menu / HMENU handles at all.
+    """
+    popup = ctk.CTkToplevel(parent)
+    popup.title(title)
+    popup.geometry(f"{width}x{height}")
+    popup.resizable(False, True)
+    # -toolwindow removes the system-menu icon, avoiding HMENU allocation on RDP
+    try:
+        popup.attributes("-toolwindow", True)
+    except Exception:
+        pass
+    popup.grab_set()
+    popup.lift()
+    popup.focus_force()
+
+    sf = ctk.CTkScrollableFrame(popup, label_text="")
+    sf.pack(fill="both", expand=True, padx=8, pady=8)
+    sf.grid_columnconfigure(0, weight=1)
+
+    for i, opt in enumerate(options):
+        is_cur = opt == current
+        ctk.CTkButton(
+            sf, text=opt, anchor="w",
+            fg_color="#2f6f43" if is_cur else ("gray25" if not is_cur else None),
+            hover_color="#27583a" if is_cur else "gray35",
+            command=lambda o=opt: (popup.destroy(), callback(o)),
+        ).grid(row=i, column=0, sticky="ew", pady=2, padx=2)
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.cfg = AppConfig.load()
 
-        ctk.set_appearance_mode(self.cfg.appearance)
-        ctk.set_default_color_theme("blue")
+        self.cfg = AppConfig.load()
+        ctk.set_appearance_mode("Dark")
 
         automation.set_directinput(self.cfg.use_directinput)
         automation.set_typos(self.cfg.humanize_typos)
@@ -275,6 +337,17 @@ class App(ctk.CTk):
         self._build_settings_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Suppress Tk's built-in right-click context menus (they can create
+        # native menu windows that crash over RDP).
+        try:
+            for cls in ("Text", "Listbox", "Entry", "Scrollbar", "Canvas"):
+                self.tk.eval(f"bind {cls} <Button-3> {{break}}")
+                self.tk.eval(f"bind {cls} <Button-2> {{break}}")
+            self.bind_all("<Button-3>", lambda e: "break")
+        except Exception:
+            pass
+
         self.log("Ready. Use the Test tab to try steps, then build a Workflow.")
 
     # ------------------------------------------------------------------
@@ -326,11 +399,11 @@ class App(ctk.CTk):
         ctk.CTkLabel(ts, text="Test a step", font=("Segoe UI", 14, "bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=10, pady=(10, 4)
         )
-        self.test_kind_menu = ctk.CTkOptionMenu(
-            ts, values=list(STEP_KINDS.values()), command=self._on_pick_test_kind, width=200
+        self._test_kind_btn = ctk.CTkButton(
+            ts, text="Pick a step type…", width=200,
+            command=self._open_test_kind_picker,
         )
-        self.test_kind_menu.set("Pick a step type…")
-        self.test_kind_menu.grid(row=1, column=0, padx=(10, 6), pady=(0, 10))
+        self._test_kind_btn.grid(row=1, column=0, padx=(10, 6), pady=(0, 10))
         self.test_step_label = ctk.CTkLabel(ts, text="No step configured.", text_color="gray", anchor="w")
         self.test_step_label.grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 10))
         self.test_edit_btn = ctk.CTkButton(ts, text="✎ Edit", width=70, command=self._edit_test_step, state="disabled")
@@ -391,42 +464,58 @@ class App(ctk.CTk):
     def _build_workflow_tab(self) -> None:
         tab = self.tab_workflow
         tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_rowconfigure(1, weight=1)   # step list expands
 
-        # --- Toolbar ---
+        # --- Toolbar (row 0): workflow selector + run controls ---
         bar = ctk.CTkFrame(tab)
-        bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 6))
-        bar.grid_columnconfigure(6, weight=1)
+        bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 4))
+        bar.grid_columnconfigure(11, weight=1)  # spacer column pushes Save/Stop right
 
-        self.add_step_menu = ctk.CTkOptionMenu(
-            bar, values=list(STEP_KINDS.values()),
-            command=lambda label: self._wf_list.on_add(label, self.add_step_menu),
-            width=170,
+        # Workflow picker cluster (left)
+        ctk.CTkLabel(bar, text="Workflow:", font=("Segoe UI", 11, "bold")).grid(
+            row=0, column=0, padx=(8, 2), pady=6)
+        self._wf_btn = ctk.CTkButton(
+            bar, text=self.cfg.active_workflow, width=130,
+            command=self._open_wf_picker,
         )
-        self.add_step_menu.set("➕  Add step…")
-        self.add_step_menu.grid(row=0, column=0, padx=(8, 6), pady=8)
+        self._wf_btn.grid(row=0, column=1, padx=2, pady=6)
+        ctk.CTkButton(bar, text="＋", width=30, command=self._new_workflow).grid(
+            row=0, column=2, padx=1, pady=6)
+        ctk.CTkButton(bar, text="✎", width=30, command=self._rename_workflow).grid(
+            row=0, column=3, padx=1, pady=6)
+        ctk.CTkButton(bar, text="📋", width=30, command=self._duplicate_workflow).grid(
+            row=0, column=4, padx=1, pady=6)
+        ctk.CTkButton(bar, text="✕", width=30, fg_color="#a13c3c", hover_color="#7d2e2e",
+                      command=self._delete_workflow).grid(row=0, column=5, padx=(1, 4), pady=6)
+        ctk.CTkLabel(bar, text="|", text_color="gray").grid(row=0, column=6, padx=4)
 
-        self.wf_run_btn = ctk.CTkButton(bar, text="▶  Run workflow", command=self._run_workflow, width=130)
-        self.wf_run_btn.grid(row=0, column=1, padx=4, pady=8)
+        # Add step + run cluster (middle)
+        ctk.CTkButton(
+            bar, text="➕ Add step", width=110,
+            command=lambda: self._open_step_picker(self._wf_list.add_by_kind),
+        ).grid(row=0, column=7, padx=4, pady=6)
 
-        ctk.CTkLabel(bar, text="repeat").grid(row=0, column=3, padx=(12, 2))
+        self.wf_run_btn = ctk.CTkButton(
+            bar, text="▶ Run workflow", command=self._run_workflow, width=120)
+        self.wf_run_btn.grid(row=0, column=8, padx=4, pady=6)
+
+        ctk.CTkLabel(bar, text="×").grid(row=0, column=9, padx=(8, 2))
         self.repeat_var = ctk.StringVar(value=str(self.cfg.workflow_repeat))
-        self.repeat_entry = ctk.CTkEntry(bar, textvariable=self.repeat_var, width=48)
-        self.repeat_entry.grid(row=0, column=4, padx=2)
+        self.repeat_entry = ctk.CTkEntry(bar, textvariable=self.repeat_var, width=44)
+        self.repeat_entry.grid(row=0, column=10, padx=2)
         self.repeat_entry.bind("<FocusOut>", lambda _e: self._persist_workflow_repeat())
         self.repeat_entry.bind("<Return>", lambda _e: self._persist_workflow_repeat())
-        ctk.CTkLabel(bar, text="×").grid(row=0, column=5, padx=(0, 8))
 
+        # Save / Stop (right cluster)
         ctk.CTkButton(bar, text="💾 Save", command=self._save_workflow, width=70).grid(
-            row=0, column=7, padx=(4, 4), pady=8
-        )
+            row=0, column=12, padx=(4, 4), pady=6)
         self.wf_stop_btn = ctk.CTkButton(
-            bar, text="⏹  Stop", command=self._stop_workflow, width=80,
+            bar, text="⏹ Stop", command=self._stop_workflow, width=72,
             fg_color="#a13c3c", hover_color="#7d2e2e",
         )
-        self.wf_stop_btn.grid(row=0, column=8, padx=(4, 8), pady=8)
+        self.wf_stop_btn.grid(row=0, column=13, padx=(2, 8), pady=6)
 
-        # --- Step list ---
+        # --- Step list (row 1, expands) ---
         self.steps_frame = ctk.CTkScrollableFrame(
             tab, label_text="Steps  (tip: type a new number in a step's box + Enter to move it)")
         self.steps_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
@@ -442,7 +531,7 @@ class App(ctk.CTk):
             on_run_only=self._run_only_step,
         )
 
-        # --- Workflow log ---
+        # --- Workflow log (row 2) ---
         logf = ctk.CTkFrame(tab)
         logf.grid(row=2, column=0, sticky="ew", padx=4, pady=(6, 4))
         logf.grid_columnconfigure(0, weight=1)
@@ -453,8 +542,8 @@ class App(ctk.CTk):
         wf_log.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 8))
         wf_log.configure(state="disabled")
         self._log_boxes.append(wf_log)
-
-        self._wf_list.refresh()
+        # Rows built shortly after startup so the toolbar always appears first
+        self.after(50, self._wf_list.refresh)
 
     def _build_restart_tab(self) -> None:
         tab = self.tab_restart
@@ -465,13 +554,10 @@ class App(ctk.CTk):
         bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 6))
         bar.grid_columnconfigure(4, weight=1)
 
-        self.restart_add_menu = ctk.CTkOptionMenu(
-            bar, values=list(STEP_KINDS.values()),
-            command=lambda label: self._restart_list.on_add(label, self.restart_add_menu),
-            width=170,
-        )
-        self.restart_add_menu.set("➕  Add step…")
-        self.restart_add_menu.grid(row=0, column=0, padx=(8, 6), pady=8)
+        ctk.CTkButton(
+            bar, text="➕  Add step…", width=170,
+            command=lambda: self._open_step_picker(self._restart_list.add_by_kind),
+        ).grid(row=0, column=0, padx=(8, 6), pady=8)
 
         self.restart_run_btn = ctk.CTkButton(
             bar, text="▶  Run restart", command=self._run_restart_workflow, width=130,
@@ -505,7 +591,7 @@ class App(ctk.CTk):
             on_run_from=self._run_restart_from,
             on_run_only=self._run_restart_only,
         )
-        self._restart_list.refresh()
+        self.after(80, self._restart_list.refresh)
 
     @staticmethod
     def _step_row_summary(step: Step) -> tuple[str, str | tuple[str, str]]:
@@ -554,17 +640,17 @@ class App(ctk.CTk):
             row=0, column=3, padx=(4, 8), pady=8)
 
         # --- Header row ---
-        hdr = ctk.CTkFrame(tab)
-        hdr.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 0))
+        hdr = ctk.CTkFrame(tab, fg_color="#1a3a52")
+        hdr.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 1))
         for col, (label, w) in enumerate([
             ("#", 36), ("Started", 140), ("Type", 170),
             ("Steps", 52), ("Pass", 70), ("Restarts", 64),
             ("Duration", 76), ("Status", 80),
         ]):
             ctk.CTkLabel(hdr, text=label, font=("Segoe UI", 11, "bold"),
-                         width=w, anchor="w").grid(
+                         text_color="#ffffff", width=w, anchor="w").grid(
                 row=0, column=col, padx=(6 if col == 0 else 2, 2),
-                pady=4, sticky="w")
+                pady=6, sticky="w")
 
         # --- Scrollable body ---
         self.history_frame = ctk.CTkScrollableFrame(tab, label_text="")
@@ -576,23 +662,23 @@ class App(ctk.CTk):
             self._render_history_row(record)
 
     _STATUS_COLOR = {
-        "Finished": "#2f6f43",
-        "Stopped":  "#7a6000",
-        "Failed":   "#a13c3c",
+        "Finished": "#4caf78",
+        "Stopped":  "#e0b030",
+        "Failed":   "#e05555",
     }
 
     def _render_history_row(self, record: workflow.RunRecord) -> None:
         i = self._history_row_count
         self._history_row_count += 1
-        bg = "#1e1e1e" if i % 2 == 0 else "#252525"
-        row = ctk.CTkFrame(self.history_frame, fg_color=bg)
-        row.grid(row=i, column=0, sticky="ew", padx=0, pady=0)
+        bg = "#2e2e2e" if i % 2 == 0 else "#3a3a3a"
+        row = ctk.CTkFrame(self.history_frame, fg_color=bg, corner_radius=4)
+        row.grid(row=i, column=0, sticky="ew", padx=2, pady=2)
 
         duration_str = (
             f"{int(record.duration_s // 60)}m {int(record.duration_s % 60)}s"
             if record.duration_s >= 60 else f"{record.duration_s:.1f}s"
         )
-        status_color = self._STATUS_COLOR.get(record.status, "gray")
+        status_color = self._STATUS_COLOR.get(record.status, "#aaaaaa")
         pass_label = (f"{record.pass_number}/{record.total_passes}"
                       if record.total_passes > 1 else "1")
         values = [
@@ -605,20 +691,22 @@ class App(ctk.CTk):
             duration_str,
             record.status,
         ]
+        STATUS_COL = 7
         for col, (val, w) in enumerate(zip(values, self._history_col_widths)):
-            color = status_color if col == 8 else ctk.ThemeManager.theme["CTkLabel"]["text_color"]
-            font = ("Segoe UI", 11, "bold") if col == 8 else ("Segoe UI", 11)
+            is_status = col == STATUS_COL
+            color = status_color if is_status else "#e0e0e0"
+            font = ("Segoe UI", 11, "bold") if is_status else ("Segoe UI", 11)
             ctk.CTkLabel(row, text=val, width=w, anchor="w",
                          font=font, text_color=color).grid(
                 row=0, column=col,
-                padx=(6 if col == 0 else 2, 2), pady=3, sticky="w")
+                padx=(6 if col == 0 else 2, 2), pady=5, sticky="w")
 
         if record.fail_reason:
             ctk.CTkLabel(row, text=f"  ⚠ {record.fail_reason}",
-                         text_color="#c47a00", font=("Segoe UI", 10),
+                         text_color="#e09040", font=("Segoe UI", 10),
                          anchor="w").grid(
                 row=1, column=0, columnspan=8,
-                sticky="ew", padx=8, pady=(0, 3))
+                sticky="ew", padx=8, pady=(0, 4))
 
     def _add_history_record(self, record: workflow.RunRecord) -> None:
         self._run_history.append(record)
@@ -647,14 +735,163 @@ class App(ctk.CTk):
         except Exception as exc:  # noqa: BLE001
             self.log(f"Could not save repeat count: {exc}")
 
-    def _save_workflow(self) -> None:
-        self.cfg.steps = [s.as_dict() for s in self._steps]
+    # ---- multiple named workflows ------------------------------------
+    def _workflow_names(self) -> list[str]:
+        names = list(self.cfg.named_workflows.keys())
+        return names if names else ["Default"]
+
+    def _flush_active_workflow(self) -> None:
+        """Write the current in-memory steps back into named_workflows."""
         self._collect_workflow_repeat()
+        self.cfg.steps = [s.as_dict() for s in self._steps]
+        self.cfg.restart_steps = [s.as_dict() for s in self._restart_steps]
+        self.cfg.named_workflows[self.cfg.active_workflow] = {
+            "steps": self.cfg.steps,
+            "restart_steps": self.cfg.restart_steps,
+            "repeat": self.cfg.workflow_repeat,
+        }
+
+    def _load_active_workflow(self) -> None:
+        """Reload in-memory steps from the active named workflow."""
+        wf = self.cfg.named_workflows.get(self.cfg.active_workflow, {})
+        self._steps.clear()
+        self._steps.extend(Step.from_dict(d) for d in wf.get("steps", []))
+        self._restart_steps.clear()
+        self._restart_steps.extend(Step.from_dict(d) for d in wf.get("restart_steps", []))
+        try:
+            self.repeat_var.set(str(max(1, wf.get("repeat", 1))))
+        except Exception:
+            pass
+        if hasattr(self, "_wf_list"):
+            self._wf_list.refresh()
+        if hasattr(self, "_restart_list"):
+            self._restart_list.refresh()
+
+    def _open_step_picker(self, callback) -> None:
+        """Open a step-kind picker popup and call callback(kind) on selection."""
+        labels = list(STEP_KINDS.values())
+        kinds = list(STEP_KINDS.keys())
+        def on_label(label: str) -> None:
+            callback(kinds[labels.index(label)])
+        _open_picker(self, "Add step", labels, on_label, height=430)
+
+    def _open_test_kind_picker(self) -> None:
+        """Picker for the Test-tab step kind selector."""
+        labels = list(STEP_KINDS.values())
+        kinds = list(STEP_KINDS.keys())
+        def on_label(label: str) -> None:
+            self._test_kind_btn.configure(text=label)
+            kind = kinds[labels.index(label)]
+            self._on_pick_test_kind_by_kind(kind)
+        _open_picker(self, "Pick step type", labels, on_label, height=430)
+
+    def _open_wf_picker(self) -> None:
+        """Picker for the workflow switcher button."""
+        names = self._workflow_names()
+        _open_picker(self, "Switch workflow", names, self._on_switch_workflow,
+                     current=self.cfg.active_workflow, width=280, height=320)
+
+    def _open_provider_picker(self) -> None:
+        """Picker for the AI provider selector."""
+        labels = ai_client.provider_labels()
+        current = ai_client.label_for(self.cfg.provider)
+        _open_picker(self, "Select AI provider", labels, self._on_provider_change,
+                     current=current, width=300, height=280)
+
+    def _refresh_wf_selector(self) -> None:
+        self._wf_btn.configure(text=self.cfg.active_workflow)
+
+    def _on_switch_workflow(self, name: str) -> None:
+        if name == self.cfg.active_workflow:
+            return
+        self._flush_active_workflow()
+        self.cfg.active_workflow = name
+        self._load_active_workflow()
+        self.cfg.save()
+        self.log(f"Switched to workflow: {name}")
+
+    def _new_workflow(self) -> None:
+        import tkinter.simpledialog as sd
+        name = sd.askstring("New workflow", "Enter a name for the new workflow:",
+                            parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name in self.cfg.named_workflows:
+            self.log(f"A workflow named '{name}' already exists.")
+            return
+        self._flush_active_workflow()
+        self.cfg.named_workflows[name] = {"steps": [], "restart_steps": [], "repeat": 1}
+        self.cfg.active_workflow = name
+        self._load_active_workflow()
+        self._refresh_wf_selector()
+        self.cfg.save()
+        self.log(f"Created new workflow: {name}")
+
+    def _rename_workflow(self) -> None:
+        import tkinter.simpledialog as sd
+        old = self.cfg.active_workflow
+        new = sd.askstring("Rename workflow", f"New name for '{old}':", parent=self)
+        if not new or not new.strip():
+            return
+        new = new.strip()
+        if new == old:
+            return
+        if new in self.cfg.named_workflows:
+            self.log(f"A workflow named '{new}' already exists.")
+            return
+        self._flush_active_workflow()
+        self.cfg.named_workflows[new] = self.cfg.named_workflows.pop(old)
+        self.cfg.active_workflow = new
+        self._refresh_wf_selector()
+        self.cfg.save()
+        self.log(f"Renamed '{old}' → '{new}'")
+
+    def _duplicate_workflow(self) -> None:
+        import tkinter.simpledialog as sd
+        import copy
+        src = self.cfg.active_workflow
+        name = sd.askstring("Copy workflow", f"Name for the copy of '{src}':", parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name in self.cfg.named_workflows:
+            self.log(f"A workflow named '{name}' already exists.")
+            return
+        self._flush_active_workflow()
+        self.cfg.named_workflows[name] = copy.deepcopy(self.cfg.named_workflows[src])
+        self.cfg.active_workflow = name
+        self._load_active_workflow()
+        self._refresh_wf_selector()
+        self.cfg.save()
+        self.log(f"Duplicated '{src}' → '{name}'")
+
+    def _delete_workflow(self) -> None:
+        import tkinter.messagebox as mb
+        name = self.cfg.active_workflow
+        if len(self.cfg.named_workflows) <= 1:
+            self.log("Cannot delete the last workflow.")
+            return
+        if not mb.askyesno("Delete workflow",
+                           f"Delete workflow '{name}'? This cannot be undone.",
+                           parent=self):
+            return
+        del self.cfg.named_workflows[name]
+        self.cfg.active_workflow = next(iter(self.cfg.named_workflows))
+        self._load_active_workflow()
+        self._refresh_wf_selector()
+        self.cfg.save()
+        self.log(f"Deleted workflow: {name}")
+
+    def _save_workflow(self) -> None:
+        self._flush_active_workflow()
         self._save_settings()
-        self.log(f"Workflow saved ({len(self._steps)} steps).")
+        self.log(f"Workflow '{self.cfg.active_workflow}' saved ({len(self._steps)} steps).")
 
     def _save_restart_workflow(self) -> None:
         self.cfg.restart_steps = [s.as_dict() for s in self._restart_steps]
+        if self.cfg.active_workflow in self.cfg.named_workflows:
+            self.cfg.named_workflows[self.cfg.active_workflow]["restart_steps"] = self.cfg.restart_steps
         self._save_settings()
         self.log(f"Restart workflow saved ({len(self._restart_steps)} steps).")
 
@@ -703,6 +940,7 @@ class App(ctk.CTk):
         total_enabled = sum(1 for s in run_slice if s.enabled)
 
         def _run() -> None:
+            guarded = self._rdp_clipboard_guard_begin()
             try:
                 runner.run(
                     repeat=repeat,
@@ -713,10 +951,34 @@ class App(ctk.CTk):
                     total_steps=total_enabled,
                 )
             finally:
+                self._rdp_clipboard_guard_end(guarded)
                 self.after(0, lambda: self.wf_run_btn.configure(state="normal"))
 
         self._wf_thread = threading.Thread(target=_run, daemon=True)
         self._wf_thread.start()
+
+    def _rdp_clipboard_guard_begin(self) -> bool:
+        """Pause RDP clipboard sync (kill rdpclip.exe) while automating so the
+        client machine's clipboard can't overwrite ours mid-paste.  Returns
+        True if it was suspended and must be resumed afterwards."""
+        if not getattr(self.cfg, "manage_rdp_clipboard", False):
+            return False
+        try:
+            if automation.suspend_rdp_clipboard():
+                self.log("Paused RDP clipboard sync (rdpclip.exe) for reliable paste.")
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _rdp_clipboard_guard_end(self, suspended: bool) -> None:
+        if not suspended:
+            return
+        try:
+            automation.resume_rdp_clipboard()
+            self.log("Restored RDP clipboard sync.")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _run_workflow(self) -> None:
         self._collect_workflow_repeat()
@@ -814,11 +1076,11 @@ class App(ctk.CTk):
             self.cfg.models[self.cfg.provider] = self.cfg.model
 
         r = row_label("AI provider")
-        self.provider_menu = ctk.CTkOptionMenu(
-            frame, values=ai_client.provider_labels(), command=self._on_provider_change
+        self._provider_btn = ctk.CTkButton(
+            frame, text=ai_client.label_for(self.cfg.provider),
+            command=self._open_provider_picker, anchor="w",
         )
-        self.provider_menu.set(ai_client.label_for(self.cfg.provider))
-        self.provider_menu.grid(row=r, column=1, columnspan=2, sticky="ew", padx=10, pady=8)
+        self._provider_btn.grid(row=r, column=1, columnspan=2, sticky="ew", padx=10, pady=8)
 
         r = row_label("API key")
         self.api_key_entry = ctk.CTkEntry(frame, show="•", placeholder_text="paste key…")
@@ -831,9 +1093,9 @@ class App(ctk.CTk):
         ).grid(row=r, column=2, padx=6)
 
         r = row_label("Model")
-        self.model_combo = ctk.CTkComboBox(frame, values=[ai_client.default_model(self.cfg.provider)])
+        self.model_combo = ctk.CTkEntry(frame, placeholder_text="e.g. gpt-4o-mini")
         self.model_combo.grid(row=r, column=1, sticky="ew", padx=10, pady=8)
-        self.model_combo.set(
+        self.model_combo.insert(0,
             self.cfg.models.get(self.cfg.provider) or self.cfg.model
             or ai_client.default_model(self.cfg.provider))
         self.fetch_btn = ctk.CTkButton(frame, text="↻ Fetch", width=72, command=self._fetch_models)
@@ -922,12 +1184,29 @@ class App(ctk.CTk):
             text_color="gray", wraplength=560, justify="left",
         ).grid(row=next_row(), column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
 
+        self.rdpclip_var = ctk.BooleanVar(
+            value=getattr(self.cfg, "manage_rdp_clipboard", True))
+        ctk.CTkCheckBox(
+            frame,
+            text="Lock clipboard during runs (fixes Ctrl+V / image paste over RDP)",
+            variable=self.rdpclip_var, command=self._on_rdpclip_toggle,
+        ).grid(row=next_row(), column=0, columnspan=3, sticky="w", padx=10, pady=8)
+        ctk.CTkLabel(
+            frame,
+            text="Keep this ON when the bot runs in an RDP session. It pauses "
+                 "RDP clipboard sharing (rdpclip.exe) while a workflow or test "
+                 "runs so that copying something on your local laptop can't "
+                 "overwrite what the bot puts on the clipboard. Sharing is "
+                 "automatically restored when the run finishes.",
+            text_color="gray", wraplength=560, justify="left",
+        ).grid(row=next_row(), column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+
         r = row_label("Appearance")
-        self.appearance_menu = ctk.CTkOptionMenu(
+        self.appearance_seg = ctk.CTkSegmentedButton(
             frame, values=["System", "Dark", "Light"], command=self._on_appearance
         )
-        self.appearance_menu.grid(row=r, column=1, sticky="w", padx=10, pady=8)
-        self.appearance_menu.set(self.cfg.appearance)
+        self.appearance_seg.grid(row=r, column=1, sticky="w", padx=10, pady=8)
+        self.appearance_seg.set(self.cfg.appearance)
 
         ctk.CTkButton(frame, text="💾  Save settings", command=self._save_settings).grid(
             row=next_row(), column=0, columnspan=3, sticky="ew", padx=10, pady=16
@@ -1021,14 +1300,12 @@ class App(ctk.CTk):
     # Test a single step
     # ------------------------------------------------------------------
     def _on_pick_test_kind(self, label: str) -> None:
-        self.test_kind_menu.set("Pick a step type…")
-        kind = None
-        for k, name in STEP_KINDS.items():
-            if name == label:
-                kind = k
-                break
-        if kind is None:
-            return
+        """Legacy label-based callback (kept for compatibility)."""
+        kind = next((k for k, n in STEP_KINDS.items() if n == label), None)
+        if kind:
+            self._on_pick_test_kind_by_kind(kind)
+
+    def _on_pick_test_kind_by_kind(self, kind: str) -> None:
         step = Step(kind=kind)
         if kind in ("move", "ai_paste_macro", "image_paste"):
             step.use_point = True
@@ -1065,9 +1342,11 @@ class App(ctk.CTk):
         runner = WorkflowRunner([self._test_step], ctx, self._test_stop)
 
         def _run() -> None:
+            guarded = self._rdp_clipboard_guard_begin()
             try:
                 runner.run(repeat=1)
             finally:
+                self._rdp_clipboard_guard_end(guarded)
                 self.after(0, lambda: self.test_run_btn.configure(state="normal"))
 
         self._test_thread = threading.Thread(target=_run, daemon=True)
@@ -1101,6 +1380,7 @@ class App(ctk.CTk):
         automation.set_directinput(self.cfg.use_directinput)
         self.cfg.disable_failsafe = self.failsafe_var.get()
         automation.set_failsafe(not self.cfg.disable_failsafe)
+        self.cfg.manage_rdp_clipboard = self.rdpclip_var.get()
         try:
             self.cfg.humanize_min = float(self.hmin_entry.get())
         except ValueError:
@@ -1116,7 +1396,8 @@ class App(ctk.CTk):
     # Settings handlers
     # ------------------------------------------------------------------
     def _on_appearance(self, value: str) -> None:
-        ctk.set_appearance_mode(value)
+        _mode = value if value in ("Dark", "Light") else "Dark"
+        ctk.set_appearance_mode(_mode)
         self.cfg.appearance = value
 
     def _on_directinput_toggle(self) -> None:
@@ -1130,6 +1411,11 @@ class App(ctk.CTk):
         self.cfg.disable_failsafe = disabled
         automation.set_failsafe(not disabled)
         self.log("Corner fail-safe " + ("DISABLED (use Stop to halt)." if disabled else "enabled."))
+
+    def _on_rdpclip_toggle(self) -> None:
+        enabled = self.rdpclip_var.get()
+        self.cfg.manage_rdp_clipboard = enabled
+        self.log("RDP clipboard lock during runs " + ("enabled." if enabled else "disabled."))
 
     def _stash_current_provider(self) -> None:
         """Remember the key/model currently in the entry boxes for the provider
@@ -1165,9 +1451,10 @@ class App(ctk.CTk):
         model = self.cfg.models.get(new_provider) or ai_client.default_model(new_provider)
         self.api_key_entry.delete(0, "end")
         self.api_key_entry.insert(0, key)
-        self.model_combo.configure(values=[ai_client.default_model(new_provider)])
-        self.model_combo.set(model)
+        self.model_combo.delete(0, "end")
+        self.model_combo.insert(0, model)
         self._update_provider_hints(new_provider)
+        self._provider_btn.configure(text=label)
         self.log(f"AI provider: {label}.")
 
     def _fetch_models(self) -> None:
@@ -1195,11 +1482,11 @@ class App(ctk.CTk):
                 if not models:
                     self.log("No models returned by the provider.")
                     return
-                current = self.model_combo.get()
-                self.model_combo.configure(values=models)
+                current = self.model_combo.get().strip()
                 if current not in models:
-                    self.model_combo.set(models[0])
-                self.log(f"Fetched {len(models)} models — choose one from the Model dropdown.")
+                    self.model_combo.delete(0, "end")
+                    self.model_combo.insert(0, models[0])
+                self.log(f"Fetched {len(models)} models. First: {models[0]}. Type the model name in the Model field.")
             self.after(0, apply)
 
         threading.Thread(target=work, daemon=True).start()
@@ -1246,6 +1533,10 @@ class StepEditor(ctk.CTkToplevel):
         self.resizable(True, True)
         self.minsize(440, 420)
         self.transient(app)
+        try:
+            self.attributes("-toolwindow", True)
+        except Exception:
+            pass
         self.grid_columnconfigure(0, weight=1)
 
         self.body = ctk.CTkScrollableFrame(self)
@@ -1308,13 +1599,13 @@ class StepEditor(ctk.CTkToplevel):
         if kind == "click":
             r = self._next()
             ctk.CTkLabel(self.body, text="Button").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.button_menu = ctk.CTkOptionMenu(self.body, values=["left", "right", "middle"])
+            self.button_menu = ctk.CTkSegmentedButton(self.body, values=["left", "right", "middle"])
             self.button_menu.set(self.step.button)
             self.button_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Clicks").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.clicks_menu = ctk.CTkOptionMenu(self.body, values=["1", "2", "3"])
+            self.clicks_menu = ctk.CTkSegmentedButton(self.body, values=["1", "2", "3"])
             self.clicks_menu.set(str(self.step.clicks))
             self.clicks_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
             self._add_point_fields("click point")
@@ -1327,7 +1618,7 @@ class StepEditor(ctk.CTkToplevel):
             r = self._next()
             ctk.CTkLabel(self.body, text="Direction").grid(
                 row=r, column=0, sticky="w", padx=8, pady=6)
-            self.scroll_dir_menu = ctk.CTkOptionMenu(self.body, values=["Down", "Up"])
+            self.scroll_dir_menu = ctk.CTkSegmentedButton(self.body, values=["Down", "Up"])
             self.scroll_dir_menu.set("Up" if self.step.amount > 0 else "Down")
             self.scroll_dir_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
@@ -1357,8 +1648,8 @@ class StepEditor(ctk.CTkToplevel):
         elif kind == "key":
             self._label("Key or hotkey")
             r = self._row
-            self.keys_combo = ctk.CTkComboBox(self.body, values=COMMON_KEYS)
-            self.keys_combo.set(self.step.keys or "enter")
+            self.keys_combo = ctk.CTkEntry(self.body, placeholder_text="enter, tab, ctrl+v…")
+            self.keys_combo.insert(0, self.step.keys or "enter")
             self.keys_combo.grid(row=r, column=1, sticky="ew", padx=8, pady=6)
             self._next()
             ctk.CTkLabel(
@@ -1403,13 +1694,13 @@ class StepEditor(ctk.CTkToplevel):
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Button").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.button_menu = ctk.CTkOptionMenu(self.body, values=["left", "right", "middle"])
+            self.button_menu = ctk.CTkSegmentedButton(self.body, values=["left", "right", "middle"])
             self.button_menu.set(self.step.button)
             self.button_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Clicks").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.clicks_menu = ctk.CTkOptionMenu(self.body, values=["1", "2", "3"])
+            self.clicks_menu = ctk.CTkSegmentedButton(self.body, values=["1", "2", "3"])
             self.clicks_menu.set(str(self.step.clicks))
             self.clicks_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
@@ -1498,13 +1789,13 @@ class StepEditor(ctk.CTkToplevel):
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Click button").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.button_menu = ctk.CTkOptionMenu(self.body, values=["left", "right", "middle"])
+            self.button_menu = ctk.CTkSegmentedButton(self.body, values=["left", "right", "middle"])
             self.button_menu.set(self.step.button)
             self.button_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Clicks").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.clicks_menu = ctk.CTkOptionMenu(self.body, values=["1", "2", "3"])
+            self.clicks_menu = ctk.CTkSegmentedButton(self.body, values=["1", "2", "3"])
             self.clicks_menu.set(str(self.step.clicks))
             self.clicks_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
@@ -1585,13 +1876,13 @@ class StepEditor(ctk.CTkToplevel):
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Destination click button").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.button_menu = ctk.CTkOptionMenu(self.body, values=["left", "right", "middle"])
+            self.button_menu = ctk.CTkSegmentedButton(self.body, values=["left", "right", "middle"])
             self.button_menu.set(self.step.button)
             self.button_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Destination clicks").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.clicks_menu = ctk.CTkOptionMenu(self.body, values=["1", "2", "3"])
+            self.clicks_menu = ctk.CTkSegmentedButton(self.body, values=["1", "2", "3"])
             self.clicks_menu.set(str(self.step.clicks))
             self.clicks_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
@@ -1625,13 +1916,13 @@ class StepEditor(ctk.CTkToplevel):
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Destination click button").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.button_menu = ctk.CTkOptionMenu(self.body, values=["left", "right", "middle"])
+            self.button_menu = ctk.CTkSegmentedButton(self.body, values=["left", "right", "middle"])
             self.button_menu.set(self.step.button)
             self.button_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 
             r = self._next()
             ctk.CTkLabel(self.body, text="Destination clicks").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-            self.clicks_menu = ctk.CTkOptionMenu(self.body, values=["1", "2", "3"])
+            self.clicks_menu = ctk.CTkSegmentedButton(self.body, values=["1", "2", "3"])
             self.clicks_menu.set(str(self.step.clicks))
             self.clicks_menu.grid(row=r, column=1, sticky="w", padx=8, pady=6)
 

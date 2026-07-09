@@ -18,9 +18,13 @@ automation looks less robotic.
 from __future__ import annotations
 
 import random
+import subprocess
 import threading
 import time
 from typing import Callable, Optional
+
+# Windows: run helper processes (taskkill/tasklist/rdpclip) with no console flash.
+_CREATE_NO_WINDOW = 0x08000000
 
 import pyautogui
 from pynput import mouse
@@ -269,33 +273,50 @@ def get_clipboard() -> str:
         return ""
 
 
-def set_clipboard(text: str) -> None:
-    if pyperclip is None:
-        return
-    try:
-        pyperclip.copy(text)
-    except Exception:  # noqa: BLE001
-        pass
+def set_clipboard(text: str, *, verify: bool = True, retries: int = 10,
+                  delay: float = 0.05) -> bool:
+    """Copy text to the clipboard, verifying it actually "stuck".
 
-
-def set_clipboard_image(image) -> bool:
-    """Put a PIL image on the Windows clipboard as a device-independent bitmap
-    (``CF_DIB``) so it can be pasted as a real image with Ctrl+V.
-
-    Implemented with ``ctypes`` (no extra dependency). Returns True on success.
+    On RDP / AnyDesk sessions the remote clipboard is continuously re-synced
+    from the client machine's clipboard by ``rdpclip.exe``.  A value we set can
+    be silently overwritten milliseconds later (e.g. if the user copied
+    something on their local laptop), so a naive copy-then-paste ends up
+    pasting the wrong thing.  We therefore write, read back, and retry until the
+    clipboard truly holds our text.  Returns True if verified (or if verify is
+    off and the copy did not raise).
     """
-    import ctypes
-    import io
-    from ctypes import wintypes
+    if pyperclip is None:
+        return False
+    ok = False
+    for _ in range(max(1, retries)):
+        try:
+            pyperclip.copy(text)
+            ok = True
+        except Exception:  # noqa: BLE001
+            ok = False
+        if not verify:
+            return ok
+        time.sleep(delay)
+        try:
+            if (pyperclip.paste() or "") == text:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return ok
 
+
+def clipboard_has_image() -> bool:
+    """True if the clipboard currently holds a bitmap (``CF_DIB``)."""
     try:
-        buf = io.BytesIO()
-        image.convert("RGB").save(buf, "BMP")
-        bmp = buf.getvalue()
-        buf.close()
-        dib = bmp[14:]  # strip the 14-byte BITMAPFILEHEADER -> raw DIB
+        import ctypes
+        return bool(ctypes.windll.user32.IsClipboardFormatAvailable(8))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _put_dib_on_clipboard(dib: bytes) -> bool:
+    import ctypes
+    from ctypes import wintypes
 
     CF_DIB = 8
     GMEM_MOVABLE = 0x0002
@@ -333,6 +354,81 @@ def set_clipboard_image(image) -> bool:
         return False
     finally:
         u32.CloseClipboard()
+
+
+def set_clipboard_image(image, *, retries: int = 5, delay: float = 0.08) -> bool:
+    """Put a PIL image on the Windows clipboard as a device-independent bitmap
+    (``CF_DIB``) so it can be pasted as a real image with Ctrl+V.
+
+    Verifies the image survived (RDP clipboard sync can wipe it) and retries a
+    few times.  Returns True once the clipboard holds a bitmap.
+    """
+    try:
+        import io
+        buf = io.BytesIO()
+        image.convert("RGB").save(buf, "BMP")
+        bmp = buf.getvalue()
+        buf.close()
+        dib = bmp[14:]  # strip the 14-byte BITMAPFILEHEADER -> raw DIB
+    except Exception:  # noqa: BLE001
+        return False
+
+    for _ in range(max(1, retries)):
+        if _put_dib_on_clipboard(dib):
+            time.sleep(delay)
+            if clipboard_has_image():
+                return True
+        else:
+            time.sleep(delay)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# RDP / remote-desktop clipboard control
+# ---------------------------------------------------------------------------
+def is_rdpclip_running() -> bool:
+    """True if ``rdpclip.exe`` (the RDP clipboard sync agent) is running."""
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq rdpclip.exe"],
+            capture_output=True, text=True, creationflags=_CREATE_NO_WINDOW,
+        )
+        return "rdpclip.exe" in (r.stdout or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def suspend_rdp_clipboard() -> bool:
+    """Stop the RDP clipboard from being overwritten by the client machine.
+
+    ``rdpclip.exe`` continuously copies the RDP *client's* clipboard onto this
+    (the remote) session.  While automating clipboard paste steps that means a
+    value we set here can be clobbered by whatever the user copied on their
+    local laptop.  Killing rdpclip.exe pauses that sync so our clipboard stays
+    intact; :func:`resume_rdp_clipboard` restores it afterwards.
+
+    Returns True if rdpclip.exe was running and got terminated.
+    """
+    if not is_rdpclip_running():
+        return False
+    try:
+        r = subprocess.run(
+            ["taskkill", "/F", "/IM", "rdpclip.exe"],
+            capture_output=True, text=True, creationflags=_CREATE_NO_WINDOW,
+        )
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def resume_rdp_clipboard() -> None:
+    """Restart ``rdpclip.exe`` to restore normal RDP clipboard sharing."""
+    if is_rdpclip_running():
+        return
+    try:
+        subprocess.Popen(["rdpclip.exe"], creationflags=_CREATE_NO_WINDOW)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def pick_point_async(callback: Callable[[Optional[tuple[int, int]]], None]) -> None:
