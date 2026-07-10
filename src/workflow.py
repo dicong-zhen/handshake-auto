@@ -27,6 +27,7 @@ STEP_KINDS: dict[str, str] = {
     "scroll": "Scroll",
     "type_text": "Type text",
     "key": "Press key / hotkey",
+    "scroll_capture": "Scroll & capture (stitch full page)",
     "capture_ai": "Capture + ask AI",
     "type_answer": "Type AI answer",
     "ai_find_click": "AI: find & click",
@@ -80,6 +81,21 @@ class Step:
     # how many times to retry an AI lookup that returns nothing (>=1)
     attempts: int = 3
 
+    # scroll_capture: stitch a full (sub)page by scrolling and capturing.
+    # `amount` = wheel notches per scroll, `use_point`/`x`/`y` = where to hover
+    # while scrolling, `use_region`/`region_*` = the pane to capture.
+    max_scrolls: int = 15        # safety cap on scroll steps
+    scroll_method: str = "wheel"  # wheel | arrows | pagedown
+    start_from_top: bool = True  # scroll to the top of the page before capturing
+    return_to_top: bool = True   # wheel back up to the start position when done
+    save_to_disk: bool = False   # also save the stitched image to captures/
+    # scroll_capture: paste the stitched image into another window afterwards.
+    # `min_delay`/`max_delay` double as the human-like pause range between
+    # scrolls; `keys`/`clear_first`/`button`/`clicks` are reused for the paste.
+    paste_to_window: bool = False
+    dest_x: int = 0
+    dest_y: int = 0
+
     # memory (save_clipboard / type_memory)
     var: str = "value"
     # type_memory: paste instantly via clipboard + Ctrl+V instead of typing
@@ -125,6 +141,13 @@ class Step:
             return f"Type text: \"{preview}\""
         if self.kind == "key":
             return f"Press: {self.keys or '(unset)'}"
+        if self.kind == "scroll_capture":
+            area = "region" if (self.use_region and self.region_width) else "capture area"
+            how = {"arrows": " (↓ keys)", "pagedown": " (PgDn)"}.get(self.scroll_method, "")
+            paste = " → paste to window" if self.paste_to_window else ""
+            extra = " → ask AI" if self.prompt.strip() else ""
+            mem = f" → [{self.var}]" if (self.prompt.strip() and self.var) else ""
+            return f"Scroll & capture full {area}{how}{paste}{extra}{mem}"
         if self.kind == "capture_ai":
             extra = " → type answer" if self.type_answer else ""
             return f"Capture + ask AI{extra}"
@@ -390,6 +413,63 @@ class WorkflowRunner:
 
         elif step.kind == "key":
             automation.press_keys(step.keys, human=human)
+
+        elif step.kind == "scroll_capture":
+            if step.use_region and step.region_width and step.region_height:
+                region = Region(
+                    full_screen=False,
+                    left=step.region_left, top=step.region_top,
+                    width=step.region_width, height=step.region_height,
+                )
+            else:
+                region = cfg.region
+            hover = (step.x, step.y) if step.use_point else None
+            notches = abs(step.amount) or 3
+            method = step.scroll_method if step.scroll_method in screen.SCROLL_METHODS else "wheel"
+            self.ctx.log(
+                f"  Scrolling & capturing the full page via {method} "
+                f"(≤{step.max_scrolls} steps)…"
+            )
+            stitched = screen.scroll_capture(
+                region,
+                hover=hover,
+                method=method,
+                notches=notches,
+                max_scrolls=max(1, int(step.max_scrolls or 15)),
+                settle_min=step.min_delay,
+                settle_max=step.max_delay,
+                human=human,
+                start_from_top=step.start_from_top,
+                return_to_top=step.return_to_top,
+                stop=self.stop,
+                log=self.ctx.log,
+                on_progress=self.ctx.on_image,
+            )
+            self.ctx.on_image(stitched)
+            self.ctx.log(f"  Stitched full page: {stitched.width}×{stitched.height}px.")
+            if step.save_to_disk:
+                try:
+                    path = screen.save_capture(stitched, prefix="fullpage")
+                    self.ctx.log(f"  Saved to {path}")
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.log(f"  Could not save image: {exc}")
+            if step.paste_to_window:
+                self._paste_image_to_window(step, stitched, human)
+            if step.prompt.strip():
+                if stitched.height > 6000:
+                    self.ctx.log("  Note: the page is very tall; the model may "
+                                 "downscale it and miss fine text.")
+                self.ctx.log(f"  Asking {cfg.model} about the full page…")
+                answer = ai_client.ask(
+                    stitched, step.prompt.strip(),
+                    api_key=cfg.api_key, model=cfg.model,
+                    base_url=cfg.base_url or None, provider=cfg.provider,
+                )
+                self.ctx.last_answer = answer
+                if step.var:
+                    self.ctx.memory[step.var] = answer
+                self.ctx.on_answer(answer)
+                self.ctx.log(f"  AI answered ({len(answer)} chars).")
 
         elif step.kind == "capture_ai":
             image = screen.capture(cfg.region)
@@ -693,6 +773,38 @@ class WorkflowRunner:
             self._sleep(random.uniform(step.min_delay, step.max_delay))
 
         return None
+
+    def _paste_image_to_window(self, step: Step, image: Image.Image, human: bool) -> None:
+        """Copy a (stitched) image to the clipboard and paste it into another
+        window: focus the destination by clicking it, then Ctrl+V.  Mirrors the
+        robust RDP handling used by the image_paste step (re-copy if the RDP
+        clipboard sync wipes the image while we focus the target)."""
+        if not automation.set_clipboard_image(image):
+            self.ctx.log("  Could not copy the stitched image to the clipboard.")
+            return
+        self.ctx.log(f"  Copied {image.width}×{image.height} image → clipboard.")
+        has_dest = bool(step.dest_x or step.dest_y)
+        if has_dest:
+            self.ctx.log(f"  Clicking destination ({step.dest_x}, {step.dest_y}) to focus it…")
+            automation.click(step.dest_x, step.dest_y, button=step.button,
+                             clicks=step.clicks, human=human)
+        else:
+            self.ctx.log("  Clicking at the cursor to focus the destination window…")
+            automation.click(button=step.button, clicks=step.clicks, human=human)
+        self._sleep(0.3)
+        if step.clear_first:
+            automation.press_keys("ctrl+a", human=human)
+            self._sleep(0.1)
+        if not automation.clipboard_has_image():
+            self.ctx.log("  Clipboard image was lost (RDP sync?); re-copying…")
+            automation.set_clipboard_image(image)
+        self.ctx.log("  Pasting image (Ctrl+V)…")
+        automation.press_keys("ctrl+v", human=human)
+        if step.keys.strip():
+            self._sleep(0.2)
+            self.ctx.log(f"  Pressing {step.keys}…")
+            automation.press_keys(step.keys.strip(), human=human)
+        self.ctx.log("  Done (stitched image pasted into the target window).")
 
     def _run_restart_workflow(self, steps: list[Step]) -> None:
         """Run the recovery workflow once (no nested restart-on-fail)."""

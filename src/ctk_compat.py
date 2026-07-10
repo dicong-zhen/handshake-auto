@@ -12,6 +12,7 @@ code can simply do ``from . import ctk_compat as ctk``.
 from __future__ import annotations
 
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Optional
 
@@ -97,8 +98,33 @@ def _extract_image(image):
     return image
 
 
-def _px_to_chars(px: int) -> int:
-    return max(1, round(px / 8))
+# Font metrics are cached per font spec so px→char/line conversion is both
+# accurate (matches the actual rendered font) and cheap.
+_FONT_METRICS: dict = {}
+
+
+def _font_metrics(font) -> tuple[float, int]:
+    """Return (average char pixel width, line height in px) for a font spec."""
+    key = tuple(font) if isinstance(font, (list, tuple)) else font
+    cached = _FONT_METRICS.get(key)
+    if cached is not None:
+        return cached
+    char_w, line_h = 8.0, 18
+    try:
+        f = tkfont.Font(font=font or DEFAULT_FONT)
+        sample = "0123456789abcdefghijklmnopqrstuvwxyz"
+        char_w = max(5.0, f.measure(sample) / len(sample))
+        line_h = max(12, f.metrics("linespace"))
+    except Exception:
+        pass
+    _FONT_METRICS[key] = (char_w, line_h)
+    return char_w, line_h
+
+
+def _px_to_chars(px: int, font=None) -> int:
+    """Convert a pixel width to the character count tk Entry/Text expect."""
+    char_w, _ = _font_metrics(font or DEFAULT_FONT)
+    return max(1, round(px / char_w))
 
 
 class _GridMixin:
@@ -187,7 +213,9 @@ class CTkLabel(tk.Label):
             opts["wraplength"] = wraplength
         if self._imgref is not None:
             opts["image"] = self._imgref
-            opts["compound"] = "left" if text else "image"
+            # tk's "compound" accepts bottom/center/left/none/right/top only;
+            # "none" shows the image alone when there is no text.
+            opts["compound"] = "left" if text else "none"
         super().__init__(master, **opts, **kw)
 
     def configure(self, **kw):  # type: ignore[override]
@@ -199,7 +227,7 @@ class CTkLabel(tk.Label):
             self._imgref = _extract_image(kw.pop("image"))
             kw["image"] = self._imgref
             if self._imgref is not None and not kw.get("text"):
-                kw.setdefault("compound", "image")
+                kw.setdefault("compound", "none")
         kw.pop("corner_radius", None)
         return super().configure(**kw)
 
@@ -218,6 +246,14 @@ class CTkButton(_GridMixin, tk.Frame):
         self._command = command
         self._state = state
         self._imgref = _extract_image(image)
+        self._font = font or DEFAULT_FONT
+        self._anchor = anchor
+
+        # Grow the fixed pixel box to fit the label so text is never clipped,
+        # and give every button a consistent minimum height that lines up with
+        # entries/checkboxes in the same row.
+        width = self._fit_width(text, width)
+        height = max(height, self._fit_height())
 
         super().__init__(master, bg=self._base, width=width, height=height,
                          highlightthickness=int(border_width or 0), bd=0)
@@ -227,8 +263,7 @@ class CTkButton(_GridMixin, tk.Frame):
         self.grid_propagate(False)
         self.pack_propagate(False)
 
-        compound = "left" if (text and self._imgref is not None) else (
-            "image" if self._imgref is not None else "none")
+        compound = "left" if (text and self._imgref is not None) else "none"
         self._label = tk.Label(
             self, text=text, bg=self._base, fg=self._txt_color,
             font=font or DEFAULT_FONT, image=self._imgref, compound=compound,
@@ -243,6 +278,18 @@ class CTkButton(_GridMixin, tk.Frame):
             w.bind("<Enter>", self._on_enter)
             w.bind("<Leave>", self._on_leave)
         self._apply_state()
+
+    def _fit_width(self, text: str, requested: int) -> int:
+        """Requested width, expanded if needed so the label fits without clipping."""
+        char_w, _ = _font_metrics(self._font)
+        text_px = round(len(text or "") * char_w)
+        img_px = 24 if self._imgref is not None else 0
+        pad = 20 if self._anchor in ("center",) else 16
+        return max(requested, text_px + img_px + pad)
+
+    def _fit_height(self) -> int:
+        _, line_h = _font_metrics(self._font)
+        return line_h + 10
 
     def _paint(self, color) -> None:
         # Bypass the overridden configure() to avoid recursing into _apply_state.
@@ -275,7 +322,15 @@ class CTkButton(_GridMixin, tk.Frame):
 
     def configure(self, **kw):  # type: ignore[override]
         if "text" in kw:
-            self._label.configure(text=kw.pop("text"))
+            new_text = kw.pop("text")
+            self._label.configure(text=new_text)
+            # Keep the box wide enough for the new label (never shrink below the
+            # current width so expanded/`sticky` buttons don't jump around).
+            try:
+                fitted = self._fit_width(new_text, self.winfo_reqwidth())
+                tk.Frame.configure(self, width=fitted)
+            except Exception:
+                pass
         if "fg_color" in kw:
             self._base = _resolve_color(kw.pop("fg_color"), self.master, BTN)
             if self._base == "transparent":
@@ -312,15 +367,16 @@ class CTkEntry(tk.Entry):
                  border_width=None, corner_radius=None, **kw):
         self._placeholder = placeholder_text or ""
         self._has_placeholder = False
+        _font = font or DEFAULT_FONT
         opts = dict(
             bg=_resolve_color(fg_color, master, ENTRY_BG),
             fg=_resolve_color(text_color, master, ENTRY_FG),
             insertbackground=ENTRY_FG,
             disabledbackground=DISABLED_BG,
             relief="flat",
-            font=font or DEFAULT_FONT,
+            font=_font,
             justify=justify,
-            width=_px_to_chars(width),
+            width=_px_to_chars(width, _font),
         )
         if textvariable is not None:
             opts["textvariable"] = textvariable
@@ -404,18 +460,20 @@ class CTkCheckBox(tk.Checkbutton):
 class CTkTextbox(tk.Text):
     def __init__(self, master, height=120, width=0, wrap="word", font=None,
                  fg_color=None, text_color=None, corner_radius=None, **kw):
+        _font = font or DEFAULT_FONT
+        _, line_h = _font_metrics(_font)
         opts = dict(
             bg=_resolve_color(fg_color, master, TEXT_BG),
             fg=_resolve_color(text_color, master, TEXT_FG),
             insertbackground=TEXT_FG,
             relief="flat",
             wrap=wrap,
-            height=max(2, round(height / 20)),
-            font=font or DEFAULT_FONT,
+            height=max(2, round(height / line_h)),
+            font=_font,
             padx=6, pady=4,
         )
         if width:
-            opts["width"] = _px_to_chars(width)
+            opts["width"] = _px_to_chars(width, _font)
         super().__init__(master, **opts, **kw)
 
     def configure(self, **kw):  # type: ignore[override]
@@ -459,23 +517,57 @@ class CTkScrollableFrame(_GridMixin, tk.Frame):
 
         self.bind("<Configure>", self._on_inner_configure)
         self._canvas.bind("<Configure>", self._on_canvas_configure)
+        # Re-apply width/scrollregion when the frame first becomes visible.
+        # Tabs other than the first are built while hidden, so the canvas has
+        # no real width yet and their content would otherwise appear blank
+        # until the user interacts with it.
+        self._canvas.bind("<Map>", self._on_map)
         self._canvas.bind("<Enter>", lambda _e: self._bind_wheel())
         self._canvas.bind("<Leave>", lambda _e: self._unbind_wheel())
 
     def _on_inner_configure(self, _e=None):
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        try:
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        except Exception:
+            pass
 
     def _on_canvas_configure(self, event):
         self._canvas.itemconfigure(self._win, width=event.width)
 
+    def _on_map(self, _e=None):
+        try:
+            self._canvas.update_idletasks()
+            width = self._canvas.winfo_width()
+            if width > 1:
+                self._canvas.itemconfigure(self._win, width=width)
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        except Exception:
+            pass
+
     def _bind_wheel(self):
-        self._canvas.bind_all("<MouseWheel>", self._on_wheel)
+        try:
+            self._canvas.bind_all("<MouseWheel>", self._on_wheel)
+        except Exception:
+            pass
 
     def _unbind_wheel(self):
-        self._canvas.unbind_all("<MouseWheel>")
+        try:
+            self._canvas.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
 
     def _on_wheel(self, event):
-        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # The binding is global (bind_all) while the pointer is over this
+        # frame; guard against a canvas that has since been destroyed (e.g. a
+        # popup closed while the pointer was still inside it) to avoid Tcl
+        # errors on the next scroll.
+        try:
+            if not self._canvas.winfo_exists():
+                self._unbind_wheel()
+                return
+            self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            self._unbind_wheel()
 
     # proxy geometry managers to the outer container
     def pack(self, **kw):
@@ -595,6 +687,12 @@ class CTkTabview(_GridMixin, tk.Frame):
         self._current = name
         self._tabs[name].grid(row=0, column=0, sticky="nsew")
         self._btns[name].configure(bg=SEG_ON)
+        # Force a layout pass so content built while this tab was hidden gets
+        # its real geometry immediately instead of appearing blank.
+        try:
+            self._tabs[name].update_idletasks()
+        except Exception:
+            pass
         if self._command:
             try:
                 self._command()

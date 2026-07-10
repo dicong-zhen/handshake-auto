@@ -267,9 +267,20 @@ def _open_picker(
         popup.attributes("-toolwindow", True)
     except Exception:
         pass
-    popup.grab_set()
-    popup.lift()
-    popup.focus_force()
+
+    # Defer the grab until the window is actually viewable. Calling grab_set()
+    # on a not-yet-mapped Toplevel can raise "grab failed: window not viewable"
+    # or leave a dangling global input grab — which over RDP shows up as the
+    # app "locking up" whenever a picker window is created.
+    def _activate() -> None:
+        try:
+            popup.grab_set()
+            popup.lift()
+            popup.focus_force()
+        except Exception:
+            pass
+
+    popup.after(80, _activate)
 
     sf = ctk.CTkScrollableFrame(popup, label_text="")
     sf.pack(fill="both", expand=True, padx=8, pady=8)
@@ -658,8 +669,23 @@ class App(ctk.CTk):
         self._history_col_widths = [36, 140, 170, 52, 70, 64, 76, 80]
         self._history_row_count = 0
 
-        for record in self._run_history:
-            self._render_history_row(record)
+        # Render rows in small batches after startup. Building hundreds of rows
+        # (each ~10 widgets) synchronously here freezes the whole app on launch.
+        self.after(60, lambda: self._render_history_batch(0))
+
+    _HISTORY_BATCH = 25
+
+    def _render_history_batch(self, start: int) -> None:
+        try:
+            if not self.history_frame.winfo_exists():
+                return
+        except Exception:
+            return
+        end = min(start + self._HISTORY_BATCH, len(self._run_history))
+        for i in range(start, end):
+            self._render_history_row(self._run_history[i])
+        if end < len(self._run_history):
+            self.after(0, lambda: self._render_history_batch(end))
 
     _STATUS_COLOR = {
         "Finished": "#4caf78",
@@ -1660,6 +1686,162 @@ class StepEditor(ctk.CTkToplevel):
                 text_color="gray", wraplength=380, justify="left",
             ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
 
+        elif kind == "scroll_capture":
+            ctk.CTkLabel(
+                self.body,
+                text="Scrolls the target area from top to bottom, captures each "
+                     "screenful, and stitches them into one tall image of the "
+                     "whole page — de-duplicating the overlap automatically. "
+                     "Optionally save it and/or ask the AI about the entire page.",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(2, 6))
+
+            r = self._next()
+            ctk.CTkLabel(self.body, text="Area to capture").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+            ctk.CTkButton(self.body, text="Select region…", command=self._pick_region).grid(
+                row=r, column=1, sticky="w", padx=8, pady=6)
+            self.region_label = ctk.CTkLabel(
+                self.body, text=self._region_text(), text_color="gray", anchor="w")
+            self.region_label.grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+            r = self._next()
+            ctk.CTkLabel(self.body, text="Scroll method").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+            self.scroll_method_seg = ctk.CTkSegmentedButton(
+                self.body, values=["Wheel", "Arrow keys", "Page Down"])
+            self.scroll_method_seg.set(
+                {"arrows": "Arrow keys", "pagedown": "Page Down"}.get(self.step.scroll_method, "Wheel"))
+            self.scroll_method_seg.grid(row=r, column=1, sticky="w", padx=8, pady=6)
+            ctk.CTkLabel(
+                self.body,
+                text="Over AnyDesk/RDP, Wheel (cursor over the modal) and Arrow keys "
+                     "give small, reliable steps that stitch cleanly. Page Down is "
+                     "fastest but jumps almost a full screen, so overlap may be tight.\n"
+                     "Arrow keys / Page Down need the pane focused, so the scroll "
+                     "point below is CLICKED first — set it on an EMPTY spot inside "
+                     "the modal (not a link/button).",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+            r = self._next()
+            ctk.CTkLabel(self.body, text="Steps per scroll").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+            self.notches_entry = ctk.CTkEntry(self.body, width=90)
+            self.notches_entry.insert(0, str(abs(self.step.amount) or 3))
+            self.notches_entry.grid(row=r, column=1, sticky="w", padx=8, pady=6)
+            ctk.CTkLabel(
+                self.body, text="Wheel notches (or Down-arrow presses) per step. "
+                                "Smaller = more overlap = safer stitching (try 2–4).",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+            r = self._next()
+            ctk.CTkLabel(self.body, text="Pause between scrolls (sec)").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+            pausefr = ctk.CTkFrame(self.body, fg_color="transparent")
+            pausefr.grid(row=r, column=1, sticky="w", padx=8, pady=6)
+            self.min_entry = ctk.CTkEntry(pausefr, width=70)
+            self.min_entry.insert(0, str(self.step.min_delay if self.step.min_delay else 0.5))
+            self.min_entry.pack(side="left")
+            ctk.CTkLabel(pausefr, text="to").pack(side="left", padx=6)
+            self.max_entry = ctk.CTkEntry(pausefr, width=70)
+            self.max_entry.insert(0, str(self.step.max_delay if self.step.max_delay else 1.4))
+            self.max_entry.pack(side="left")
+            ctk.CTkLabel(
+                self.body, text="Random wait in this range after each scroll — looks "
+                                "human and lets the AnyDesk→Chrome view finish "
+                                "repainting before the next capture. Raise both if "
+                                "the connection is laggy.",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+            r = self._next()
+            ctk.CTkLabel(self.body, text="Max scroll steps").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+            self.maxscroll_entry = ctk.CTkEntry(self.body, width=90)
+            self.maxscroll_entry.insert(0, str(self.step.max_scrolls or 15))
+            self.maxscroll_entry.grid(row=r, column=1, sticky="w", padx=8, pady=6)
+            ctk.CTkLabel(
+                self.body, text="Safety cap. It stops earlier on its own once the "
+                                "page can't scroll any further.",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+            self.start_top_var = ctk.BooleanVar(value=self.step.start_from_top)
+            ctk.CTkCheckBox(self.body, text="Scroll to the top first, then capture from the beginning",
+                            variable=self.start_top_var).grid(
+                row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=6)
+
+            self.return_top_var = ctk.BooleanVar(value=self.step.return_to_top)
+            ctk.CTkCheckBox(self.body, text="Scroll back to the top when finished",
+                            variable=self.return_top_var).grid(
+                row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=6)
+
+            self.save_disk_var = ctk.BooleanVar(value=self.step.save_to_disk)
+            ctk.CTkCheckBox(self.body, text="Save the stitched image to the captures/ folder",
+                            variable=self.save_disk_var).grid(
+                row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=6)
+
+            # --- Paste the stitched image into another window ---
+            self.paste_win_var = ctk.BooleanVar(value=self.step.paste_to_window)
+            ctk.CTkCheckBox(
+                self.body, text="Paste the stitched image into another window afterwards",
+                variable=self.paste_win_var,
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(10, 4))
+
+            r = self._next()
+            ctk.CTkLabel(self.body, text="Paste destination X, Y").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+            destfr = ctk.CTkFrame(self.body, fg_color="transparent")
+            destfr.grid(row=r, column=1, sticky="ew", padx=8, pady=6)
+            self.dest_x_entry = ctk.CTkEntry(destfr, width=70)
+            self.dest_x_entry.insert(0, str(self.step.dest_x))
+            self.dest_x_entry.pack(side="left")
+            self.dest_y_entry = ctk.CTkEntry(destfr, width=70)
+            self.dest_y_entry.insert(0, str(self.step.dest_y))
+            self.dest_y_entry.pack(side="left", padx=6)
+            ctk.CTkButton(destfr, text="🎯 Pick", width=70,
+                          command=lambda: self._pick_into(self.dest_x_entry, self.dest_y_entry)).pack(side="left")
+            ctk.CTkLabel(
+                self.body, text="The field/window to paste into is focused by clicking "
+                                "here first, then Ctrl+V. Leave 0,0 to paste at the "
+                                "current cursor. Clipboard is re-copied right before "
+                                "pasting in case RDP sync wipes it.",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+            self.paste_clear_var = ctk.BooleanVar(value=self.step.clear_first)
+            ctk.CTkCheckBox(self.body, text="Clear/select the field first (Ctrl+A) before pasting",
+                            variable=self.paste_clear_var).grid(
+                row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=6)
+
+            r = self._next()
+            ctk.CTkLabel(self.body, text="Press after paste").grid(row=r, column=0, sticky="w", padx=8, pady=6)
+            self.paste_keys_entry = ctk.CTkEntry(self.body, placeholder_text="optional, e.g. enter")
+            self.paste_keys_entry.insert(0, self.step.keys)
+            self.paste_keys_entry.grid(row=r, column=1, sticky="ew", padx=8, pady=6)
+
+            self._label("Ask the AI about the full page (optional)")
+            self.prompt_box = ctk.CTkTextbox(self.body, height=80, wrap="word")
+            self.prompt_box.grid(row=self._next(), column=0, columnspan=2, sticky="ew", padx=8, pady=6)
+            self.prompt_box.insert("1.0", self.step.prompt)
+            ctk.CTkLabel(
+                self.body, text="Leave blank to only capture/stitch. If set, the whole "
+                                "stitched page is sent to the AI and the reply is stored "
+                                "as the AI answer (add a “Type AI answer” step to type it).",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
+            r = self._next()
+            ctk.CTkLabel(self.body, text="Remember answer as (optional)").grid(
+                row=r, column=0, sticky="w", padx=8, pady=6)
+            self.var_entry = ctk.CTkEntry(self.body, placeholder_text="e.g. page_text")
+            self.var_entry.insert(0, self.step.var if self.step.var != "value" else "")
+            self.var_entry.grid(row=r, column=1, sticky="ew", padx=8, pady=6)
+
+            self._add_point_fields("scroll point")
+            ctk.CTkLabel(
+                self.body, text="The scroll point is where the mouse hovers while "
+                                "scrolling, so the right pane receives the wheel. "
+                                "Leave it off to scroll from the centre of the area.",
+                text_color="gray", wraplength=380, justify="left",
+            ).grid(row=self._next(), column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+
         elif kind == "capture_ai":
             self._label("Prompt override (optional)")
             self.prompt_box = ctk.CTkTextbox(self.body, height=90, wrap="word")
@@ -2124,6 +2306,26 @@ class StepEditor(ctk.CTkToplevel):
         elif kind == "type_text":
             s.text = self.text_box.get("1.0", "end").rstrip("\n")
             s.clear_first = self.clear_var.get()
+        elif kind == "scroll_capture":
+            notches = abs(self._to_int(self.notches_entry.get(), 3)) or 3
+            s.amount = -notches
+            s.scroll_method = {"Wheel": "wheel", "Arrow keys": "arrows",
+                               "Page Down": "pagedown"}.get(self.scroll_method_seg.get(), "wheel")
+            s.max_scrolls = max(1, self._to_int(self.maxscroll_entry.get(), 15))
+            s.min_delay = self._to_float(self.min_entry.get(), 0.5)
+            s.max_delay = self._to_float(self.max_entry.get(), 1.4)
+            if s.max_delay < s.min_delay:
+                s.max_delay = s.min_delay
+            s.start_from_top = self.start_top_var.get()
+            s.return_to_top = self.return_top_var.get()
+            s.save_to_disk = self.save_disk_var.get()
+            s.paste_to_window = self.paste_win_var.get()
+            s.dest_x = self._to_int(self.dest_x_entry.get())
+            s.dest_y = self._to_int(self.dest_y_entry.get())
+            s.clear_first = self.paste_clear_var.get()
+            s.keys = self.paste_keys_entry.get().strip().lower()
+            s.prompt = self.prompt_box.get("1.0", "end").strip()
+            s.var = self.var_entry.get().strip()
         elif kind == "key":
             s.keys = self.keys_combo.get().strip().lower()
         elif kind == "capture_ai":
