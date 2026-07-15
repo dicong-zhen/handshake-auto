@@ -74,6 +74,9 @@ class AppConfig:
     models: dict = field(default_factory=dict)
     # Two-pass "zoom in" refinement for AI: find & click (more accurate, slower).
     ai_locate_refine: bool = True
+    # Fall back to on-device OCR to read screen text when the AI provider is
+    # unavailable (out of usage/credits, rate-limited, or no key set).
+    ocr_fallback: bool = True
 
     region: Region = field(default_factory=Region)
     input_point: Point = field(default_factory=Point)
@@ -137,7 +140,7 @@ class AppConfig:
                     "loop_seconds", "appearance", "humanize", "humanize_min",
                     "humanize_max", "humanize_typos", "workflow_repeat",
                     "use_directinput", "disable_failsafe", "provider",
-                    "ai_locate_refine", "manage_rdp_clipboard"):
+                    "ai_locate_refine", "manage_rdp_clipboard", "ocr_fallback"):
             if key in data and data[key] not in (None, ""):
                 setattr(self, key, data[key])
         if "steps" in data and isinstance(data["steps"], list):
@@ -196,6 +199,7 @@ class AppConfig:
             "api_keys": self.api_keys,
             "models": self.models,
             "ai_locate_refine": self.ai_locate_refine,
+            "ocr_fallback": self.ocr_fallback,
             "region": self.region.as_dict(),
             "input_point": asdict(self.input_point),
             "submit_point": asdict(self.submit_point),

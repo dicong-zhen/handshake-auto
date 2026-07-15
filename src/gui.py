@@ -1143,6 +1143,20 @@ class App(ctk.CTk):
             variable=self.refine_var,
         ).grid(row=next_row(), column=0, columnspan=3, sticky="w", padx=10, pady=8)
 
+        self.ocr_fallback_var = ctk.BooleanVar(
+            value=getattr(self.cfg, "ocr_fallback", True))
+        ctk.CTkCheckBox(
+            frame,
+            text="Fall back to on-device OCR when the AI is out of usage / unavailable",
+            variable=self.ocr_fallback_var,
+        ).grid(row=next_row(), column=0, columnspan=3, sticky="w", padx=10, pady=(8, 0))
+        self.ocr_hint = ctk.CTkLabel(
+            frame,
+            text=self._ocr_status_text(),
+            text_color="gray", wraplength=560, justify="left",
+        )
+        self.ocr_hint.grid(row=next_row(), column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+
         r = row_label("Typing speed (sec/char)")
         self.interval_entry = ctk.CTkEntry(frame, width=100)
         self.interval_entry.grid(row=r, column=1, sticky="w", padx=10, pady=8)
@@ -1402,6 +1416,7 @@ class App(ctk.CTk):
         self.cfg.humanize_typos = self.typos_var.get()
         automation.set_typos(self.cfg.humanize_typos)
         self.cfg.ai_locate_refine = self.refine_var.get()
+        self.cfg.ocr_fallback = self.ocr_fallback_var.get()
         self.cfg.use_directinput = self.directinput_var.get()
         automation.set_directinput(self.cfg.use_directinput)
         self.cfg.disable_failsafe = self.failsafe_var.get()
@@ -1442,6 +1457,24 @@ class App(ctk.CTk):
         enabled = self.rdpclip_var.get()
         self.cfg.manage_rdp_clipboard = enabled
         self.log("RDP clipboard lock during runs " + ("enabled." if enabled else "disabled."))
+
+    @staticmethod
+    def _ocr_status_text() -> str:
+        """Describe the available OCR backend for the Settings hint."""
+        try:
+            from . import ocr
+            backend = ocr.backend_name()
+        except Exception:  # noqa: BLE001
+            backend = None
+        if backend:
+            return (f"Reads the captured region's text locally when the AI can't "
+                    f"be used (out of credits, rate-limited, or no key). "
+                    f"Detected engine: {backend}. Keep the capture region tight "
+                    f"around the target for the cleanest result.")
+        return ("Reads the captured region's text locally when the AI can't be "
+                "used. No OCR engine detected — on Windows run "
+                "'pip install winocr', or install Tesseract-OCR + "
+                "'pip install pytesseract'.")
 
     def _stash_current_provider(self) -> None:
         """Remember the key/model currently in the entry boxes for the provider
@@ -2394,7 +2427,26 @@ class StepEditor(ctk.CTkToplevel):
 
 
 def main() -> None:
-    app = App()
+    # Tk sometimes fails to create its internal menu window during startup over
+    # RDP / AnyDesk. On most Windows builds this is a fatal native abort (only
+    # the run.ps1 relaunch loop can recover it), but some builds instead raise a
+    # catchable tkinter.TclError. Handle that case here with a few quick
+    # in-process retries so we don't need a full process restart, and print the
+    # sentinel string run.ps1 watches for if we still give up.
+    import tkinter as _tk
+
+    app = None
+    for attempt in range(1, 6):
+        try:
+            app = App()
+            break
+        except _tk.TclError as exc:
+            msg = str(exc)
+            print("Failed to create the menu window", flush=True)
+            print(f"Tk startup failed (attempt {attempt}/5): {msg}", flush=True)
+            time.sleep(min(0.5 * attempt, 2.0))
+    if app is None:
+        raise SystemExit("Tk could not initialise its window after several attempts.")
     app.mainloop()
 
 

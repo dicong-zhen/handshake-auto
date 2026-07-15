@@ -22,6 +22,32 @@ class AIError(Exception):
     """Raised when the AI request cannot be completed."""
 
 
+# Phrases that indicate the request failed because the account is out of
+# usage / credits, is being rate-limited, or has a billing problem — as opposed
+# to a fixable mistake like a wrong model name.  Used to decide when to fall
+# back to classic OCR.
+_QUOTA_SIGNS = (
+    "insufficient_quota", "exceeded your current quota", "quota",
+    "rate limit", "rate_limit", "ratelimit", "too many requests",
+    "billing", "payment required", "insufficient funds", "insufficient credit",
+    "out of credits", "no credits", "credit balance", "account balance",
+    "usage limit", "usage cap", "spending limit", "hard limit",
+)
+
+
+def is_quota_error(exc: object) -> bool:
+    """Heuristically decide whether a failure is due to exhausted usage.
+
+    Returns True for quota/credit/rate-limit/billing errors (HTTP 402/429 and
+    the provider phrases above), so callers can fall back to a classic method
+    instead of surfacing the error.
+    """
+    msg = str(exc).lower()
+    if any(sign in msg for sign in _QUOTA_SIGNS):
+        return True
+    return bool(re.search(r"\b(402|429)\b", msg))
+
+
 # Provider registry. ``native`` marks providers handled outside the OpenAI SDK.
 PROVIDERS: dict[str, dict] = {
     "openai": {

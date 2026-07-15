@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 from PIL import Image
 
-from . import ai_client, automation, screen
+from . import ai_client, automation, ocr, screen
 from .config import AppConfig, Region
 
 # Available step kinds and their human-readable names (used by the GUI).
@@ -460,11 +460,7 @@ class WorkflowRunner:
                     self.ctx.log("  Note: the page is very tall; the model may "
                                  "downscale it and miss fine text.")
                 self.ctx.log(f"  Asking {cfg.model} about the full page…")
-                answer = ai_client.ask(
-                    stitched, step.prompt.strip(),
-                    api_key=cfg.api_key, model=cfg.model,
-                    base_url=cfg.base_url or None, provider=cfg.provider,
-                )
+                answer = self._read_text_from_screen(stitched, step.prompt.strip(), cfg)
                 self.ctx.last_answer = answer
                 if step.var:
                     self.ctx.memory[step.var] = answer
@@ -476,11 +472,7 @@ class WorkflowRunner:
             self.ctx.on_image(image)
             prompt = step.prompt.strip() or cfg.prompt
             self.ctx.log(f"  Asking {cfg.model}…")
-            answer = ai_client.ask(
-                image, prompt,
-                api_key=cfg.api_key, model=cfg.model,
-                base_url=cfg.base_url or None, provider=cfg.provider,
-            )
+            answer = self._read_text_from_screen(image, prompt, cfg)
             self.ctx.last_answer = answer
             self.ctx.on_answer(answer)
             self.ctx.log(f"  AI answered ({len(answer)} chars).")
@@ -670,17 +662,13 @@ class WorkflowRunner:
             self.ctx.on_image(image)
             prompt = step.prompt.strip() or cfg.prompt
             self.ctx.log(f"  Asking {cfg.model} to read the screen…")
-            value = ai_client.ask(
-                image, prompt,
-                api_key=cfg.api_key, model=cfg.model,
-                base_url=cfg.base_url or None, provider=cfg.provider,
-            )
+            value = self._read_text_from_screen(image, prompt, cfg)
             self.ctx.last_answer = value
             if step.var:
                 self.ctx.memory[step.var] = value
             self.ctx.on_answer(value)
             if not value:
-                self.ctx.log("  Empty AI result; skipping paste.")
+                self.ctx.log("  Empty result; skipping paste.")
                 return
             preview = value.replace("\n", " ")
             preview = (preview[:40] + "…") if len(preview) > 40 else preview
@@ -733,11 +721,7 @@ class WorkflowRunner:
             self.ctx.on_image(image)
             prompt = step.prompt.strip() or cfg.prompt
             self.ctx.log(f"  Asking {cfg.model} to read the screen…")
-            value = ai_client.ask(
-                image, prompt,
-                api_key=cfg.api_key, model=cfg.model,
-                base_url=cfg.base_url or None, provider=cfg.provider,
-            )
+            value = self._read_text_from_screen(image, prompt, cfg)
             self.ctx.memory[step.var] = value
             self.ctx.last_answer = value
             self.ctx.on_answer(value)
@@ -773,6 +757,42 @@ class WorkflowRunner:
             self._sleep(random.uniform(step.min_delay, step.max_delay))
 
         return None
+
+    def _read_text_from_screen(self, image: Image.Image, prompt: str,
+                               cfg: AppConfig) -> str:
+        """Read text from a screenshot with the AI, transparently falling back
+        to classic on-device OCR when the AI provider is unavailable.
+
+        The fallback triggers when the account is out of usage/credits, is
+        rate-limited, or no key is set (any :class:`ai_client.AIError`), as long
+        as ``cfg.ocr_fallback`` is enabled and an OCR backend is installed.  OCR
+        returns the plain text found in the captured region, so keeping the
+        capture region tight around the target gives the cleanest result.
+        """
+        try:
+            return ai_client.ask(
+                image, prompt,
+                api_key=cfg.api_key, model=cfg.model,
+                base_url=cfg.base_url or None, provider=cfg.provider,
+            )
+        except ai_client.AIError as exc:
+            if not getattr(cfg, "ocr_fallback", True):
+                raise
+            reason = "out of usage/quota" if ai_client.is_quota_error(exc) else "AI error"
+            self.ctx.log(f"  AI unavailable ({reason}): {exc}")
+            if not ocr.available():
+                self.ctx.log("  " + ocr.install_hint())
+                raise
+            self.ctx.log(f"  Falling back to classic OCR ({ocr.backend_name()})…")
+            try:
+                text = ocr.read_text(image, log=self.ctx.log)
+            except Exception as ocr_exc:  # noqa: BLE001
+                self.ctx.log(f"  OCR failed: {ocr_exc}")
+                raise exc
+            preview = text.replace("\n", " ")
+            preview = (preview[:60] + "…") if len(preview) > 60 else preview
+            self.ctx.log(f"  OCR read {len(text)} chars: \"{preview}\"")
+            return text
 
     def _paste_image_to_window(self, step: Step, image: Image.Image, human: bool) -> None:
         """Copy a (stitched) image to the clipboard and paste it into another

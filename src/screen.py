@@ -133,12 +133,17 @@ def _vertical_advance(prev: Image.Image, curr: Image.Image) -> tuple[int, float]
     best; that offset is the scroll distance.  Using a *constant* template
     height for every candidate offset avoids the bias that a variable-length
     comparison has toward tiny overlaps.
+
+    ``target_h`` is deliberately generous and the template only ~28 % of it, so
+    the maximum offset we can resolve is ~72 % of a viewport.  That keeps large
+    steps (Page Down / big wheel notches) measurable instead of being clipped —
+    a clipped estimate looks like "no movement" and ends the capture early.
     """
-    bands, target_h = 6, 260
+    bands, target_h = 6, 400
     prev_rows, hp = _row_signature(prev, bands, target_h)
     curr_rows, hc = _row_signature(curr, bands, target_h)
     h = min(hp, hc)
-    template_h = max(6, int(h * 0.35))
+    template_h = max(6, int(h * 0.28))
     if template_h >= h:
         template_h = max(1, h - 1)
     best_s, best_diff = 0, None
@@ -246,6 +251,73 @@ def _recapture_after_lag(region, settle_max) -> "Image.Image":
     return capture(region)
 
 
+# How many extra times to re-issue a scroll that appeared to do nothing before
+# accepting that we've truly reached the end.  Over AnyDesk/RDP an individual
+# wheel/key event is regularly swallowed, or the remote view repaints a beat
+# late, so a single "no movement" reading is NOT reliable evidence of the
+# bottom/top — retrying is what stops the capture from ending prematurely.
+_END_CONFIRM_TRIES = 4
+
+
+def _confirm_advance(
+    region,
+    hover,
+    method,
+    notches,
+    settle_min,
+    settle_max,
+    human,
+    reference,
+    *,
+    going_up: bool,
+    stop,
+    log,
+) -> tuple[int, "Image.Image"]:
+    """Decide whether the page really can't move any further.
+
+    A first no-movement reading is often just a dropped input event or a slow
+    remote repaint, so we (1) wait longer and re-capture, then (2) actually
+    re-issue the scroll a few more times.  If the view moves on any attempt we
+    return that (larger) advance and the fresh capture; only if it stays put
+    across every retry do we report ``advance <= threshold`` (the true end).
+
+    ``advance`` is always measured relative to ``reference`` (the last accepted
+    frame) so the caller can append the whole recovered movement in one strip.
+    """
+    def _measure(frame):
+        if going_up:
+            adv, _ = _vertical_advance(frame, reference)
+        else:
+            adv, _ = _vertical_advance(reference, frame)
+        return adv
+
+    # 1) Maybe the last frame simply hadn't repainted yet — look again, no scroll.
+    curr = _recapture_after_lag(region, settle_max)
+    advance = _measure(curr)
+    if advance > 2:
+        return advance, curr
+
+    # 2) Re-issue the scroll a few times; the event may have been dropped.
+    for attempt in range(1, max(1, _END_CONFIRM_TRIES) + 1):
+        if stop is not None and stop.is_set():
+            break
+        if going_up:
+            _scroll_up(method, hover, notches)
+        else:
+            _scroll_down(method, hover, notches, human)
+        # A slightly longer settle on retries gives a laggy link time to catch up.
+        _settle(settle_min, settle_max + 0.4, human)
+        curr = capture(region)
+        advance = _measure(curr)
+        if advance > 2:
+            if log is not None:
+                where = "up" if going_up else "down"
+                log(f"  Scroll {where} recovered on retry {attempt} "
+                    f"(the previous scroll input was likely dropped).")
+            return advance, curr
+    return advance, curr
+
+
 def _scroll_to_top(region, hover, method, notches, settle_min, settle_max,
                    human, stop, log) -> int:
     """Move up until the view stops changing (the top of the page).
@@ -265,7 +337,7 @@ def _scroll_to_top(region, hover, method, notches, settle_min, settle_max,
 
     prev = capture(region)
     steps = 0
-    for _ in range(80):  # generous safety cap
+    for _ in range(120):  # generous safety cap
         if stop is not None and stop.is_set():
             break
         _scroll_up(method, hover, notches)
@@ -274,8 +346,12 @@ def _scroll_to_top(region, hover, method, notches, settle_min, settle_max,
         # advance of `prev` relative to `curr` = how far we just moved up.
         advance, _ = _vertical_advance(curr, prev)
         if advance <= 2:
-            curr = _recapture_after_lag(region, settle_max)
-            advance, _ = _vertical_advance(curr, prev)
+            # Don't trust a single "no movement" reading — retry before deciding
+            # we've reached the top (dropped input / slow repaint over RDP).
+            advance, curr = _confirm_advance(
+                region, hover, method, notches, settle_min, settle_max, human,
+                prev, going_up=True, stop=stop, log=log,
+            )
             if advance <= 2:
                 break
         steps += 1
@@ -347,10 +423,14 @@ def scroll_capture(
         curr = capture(region)
         advance, score = _vertical_advance(prev_view, curr)
         if advance <= 2:
-            # Might just be AnyDesk repaint lag — wait and re-check (no re-scroll)
-            # before concluding we've hit the bottom.
-            curr = _recapture_after_lag(region, settle_max)
-            advance, score = _vertical_advance(prev_view, curr)
+            # A single "no movement" reading is unreliable over AnyDesk/RDP: the
+            # scroll event may have been dropped, or the remote view just hasn't
+            # repainted yet.  Re-check and re-scroll a few times before deciding
+            # we've truly hit the bottom, so the capture isn't cut short.
+            advance, curr = _confirm_advance(
+                region, hover, method, notches, settle_min, settle_max, human,
+                prev_view, going_up=False, stop=stop, log=log,
+            )
             if advance <= 2:
                 _log(f"  Reached the bottom after {steps_done} scroll(s).")
                 break

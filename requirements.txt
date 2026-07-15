@@ -7,3 +7,8 @@ Pillow==10.4.0
 openai>=1.55.3
 anthropic>=0.39.0
 python-dotenv==1.0.1
+# Classic OCR fallback used when an AI provider runs out of usage/credits.
+# winocr uses the built-in Windows 10/11 OCR engine (no extra binary needed).
+# pytesseract is an optional alternative that needs the Tesseract-OCR binary.
+winocr==0.0.15
+pytesseract==0.3.13
