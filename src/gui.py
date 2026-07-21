@@ -244,6 +244,86 @@ class _StepListController:
         self.update_row(index)
 
 
+def _safe_topmost_off(win) -> None:
+    try:
+        if win.winfo_exists():
+            win.attributes("-topmost", False)
+    except Exception:
+        pass
+
+
+def _safe_grab(win, attempt: int = 1) -> None:
+    """Grab input for ``win`` ONLY once it is actually viewable.
+
+    Over RDP/AnyDesk a freshly-created Toplevel can take a moment to map/paint.
+    Calling ``grab_set()`` before then either raises "window not viewable" or —
+    worse — succeeds while the window is invisible, redirecting all input to a
+    window the user can't see and making the whole app appear frozen.  We only
+    grab when the window is viewable, retry a few times, and otherwise give up
+    (leaving the popup usable but non-modal) rather than ever locking the app.
+    """
+    try:
+        if not win.winfo_exists():
+            return
+        if win.winfo_viewable():
+            win.grab_set()
+            return
+    except Exception:
+        pass
+    if attempt < 8:
+        try:
+            win.after(80, lambda: _safe_grab(win, attempt + 1))
+        except Exception:
+            pass
+
+
+def _present_popup(win, parent, *, modal: bool = True, center: bool = True) -> None:
+    """Make a Toplevel reliably appear, paint and take focus over RDP/AnyDesk.
+
+    Centres the window over ``parent``, forces it visible and on top, focuses
+    it, and (optionally) grabs input safely via :func:`_safe_grab`.  Binds Esc
+    to close so a popup can always be dismissed even if something goes wrong.
+    """
+    try:
+        win.transient(parent)
+    except Exception:
+        pass
+    try:
+        win.bind("<Escape>", lambda _e: win.destroy())
+    except Exception:
+        pass
+
+    def _show() -> None:
+        try:
+            win.update_idletasks()
+            if center and parent is not None and parent.winfo_exists():
+                pw, ph = parent.winfo_width(), parent.winfo_height()
+                px, py = parent.winfo_rootx(), parent.winfo_rooty()
+                ww = win.winfo_width() or win.winfo_reqwidth()
+                wh = win.winfo_height() or win.winfo_reqheight()
+                x = px + max(0, (pw - ww) // 2)
+                y = py + max(0, (ph - wh) // 3)
+                win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        try:
+            win.deiconify()
+            win.lift()
+            win.attributes("-topmost", True)
+            win.update_idletasks()
+            win.focus_force()
+            win.after(400, lambda: _safe_topmost_off(win))
+        except Exception:
+            pass
+        if modal:
+            _safe_grab(win)
+
+    try:
+        win.after(20, _show)
+    except Exception:
+        _show()
+
+
 def _open_picker(
     parent: ctk.CTk,
     title: str,
@@ -268,20 +348,6 @@ def _open_picker(
     except Exception:
         pass
 
-    # Defer the grab until the window is actually viewable. Calling grab_set()
-    # on a not-yet-mapped Toplevel can raise "grab failed: window not viewable"
-    # or leave a dangling global input grab — which over RDP shows up as the
-    # app "locking up" whenever a picker window is created.
-    def _activate() -> None:
-        try:
-            popup.grab_set()
-            popup.lift()
-            popup.focus_force()
-        except Exception:
-            pass
-
-    popup.after(80, _activate)
-
     sf = ctk.CTkScrollableFrame(popup, label_text="")
     sf.pack(fill="both", expand=True, padx=8, pady=8)
     sf.grid_columnconfigure(0, weight=1)
@@ -294,6 +360,10 @@ def _open_picker(
             hover_color="#27583a" if is_cur else "gray35",
             command=lambda o=opt: (popup.destroy(), callback(o)),
         ).grid(row=i, column=0, sticky="ew", pady=2, padx=2)
+
+    # Show + focus + safe grab AFTER the content exists so the window has its
+    # real size to centre by and something to paint immediately.
+    _present_popup(popup, parent)
 
 
 class App(ctk.CTk):
@@ -333,7 +403,7 @@ class App(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.tabs = ctk.CTkTabview(self)
+        self.tabs = ctk.CTkTabview(self, command=self._on_tab_changed)
         self.tabs.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         self.tab_run = self.tabs.add("Test")
         self.tab_workflow = self.tabs.add("Workflow")
@@ -360,6 +430,48 @@ class App(ctk.CTk):
             pass
 
         self.log("Ready. Use the Test tab to try steps, then build a Workflow.")
+
+        # Pull the window to the front on launch so a stray remote-desktop
+        # overlay/tooltip doesn't end up sitting on top of it.
+        self.after(150, self._bring_to_front)
+
+        # Apply the initial tab visibility once the step/history lists have been
+        # populated (they're filled a few ms after launch), so the inactive
+        # tabs' scrollable content is hidden and can't float at the screen top.
+        self.after(200, self._on_tab_changed)
+
+    def _on_tab_changed(self) -> None:
+        """Keep only the active tab's scrollable list drawn.
+
+        Over RDP a scrollable frame that lives in an inactive tab renders its
+        content detached at the top-left of the screen. We hide every non-active
+        tab's list and show the active one.
+        """
+        try:
+            active = self.tabs.get()
+        except Exception:  # noqa: BLE001
+            return
+        lists = {
+            "Workflow": getattr(self, "steps_frame", None),
+            "Restart": getattr(self, "restart_steps_frame", None),
+            "History": getattr(self, "history_frame", None),
+        }
+        for tab_name, frame in lists.items():
+            if frame is not None and hasattr(frame, "set_content_visible"):
+                try:
+                    frame.set_content_visible(tab_name == active)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _bring_to_front(self) -> None:
+        try:
+            self.deiconify()
+            self.lift()
+            self.attributes("-topmost", True)
+            self.focus_force()
+            self.after(500, lambda: self.attributes("-topmost", False))
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Test tab — try one step at a time before building a workflow
@@ -553,7 +665,10 @@ class App(ctk.CTk):
         wf_log.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 8))
         wf_log.configure(state="disabled")
         self._log_boxes.append(wf_log)
-        # Rows built shortly after startup so the toolbar always appears first
+        # Build the rows shortly after startup (while still on the Test tab) so
+        # the canvas paints their content correctly when the Workflow tab is
+        # first shown. (Building into an already-visible canvas doesn't repaint
+        # reliably over RDP.)
         self.after(50, self._wf_list.refresh)
 
     def _build_restart_tab(self) -> None:
@@ -836,10 +951,81 @@ class App(ctk.CTk):
         self.cfg.save()
         self.log(f"Switched to workflow: {name}")
 
+    def _ask_string(self, title: str, prompt: str, *, initial: str = "") -> Optional[str]:
+        """RDP-safe replacement for tkinter.simpledialog.askstring.
+
+        The native simpledialog grabs input on a window that may not have
+        painted yet over RDP, which can freeze the app. This builds the same
+        prompt from the native-widget shim and shows it via _present_popup, so
+        it always appears and can always be dismissed (Esc / Cancel)."""
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(title)
+        dlg.geometry("380x160")
+        dlg.resizable(False, False)
+        try:
+            dlg.attributes("-toolwindow", True)
+        except Exception:
+            pass
+        result: dict[str, Optional[str]] = {"value": None}
+
+        ctk.CTkLabel(dlg, text=prompt, wraplength=344, justify="left").pack(
+            anchor="w", padx=14, pady=(14, 6))
+        entry = ctk.CTkEntry(dlg, width=344)
+        entry.pack(padx=14, pady=(0, 10), fill="x")
+        if initial:
+            entry.insert(0, initial)
+
+        def _ok() -> None:
+            result["value"] = entry.get().strip()
+            dlg.destroy()
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(fill="x", padx=14, pady=(0, 12))
+        btns.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(btns, text="Cancel", fg_color="gray", command=dlg.destroy).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(btns, text="OK", command=_ok).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0))
+
+        entry.bind("<Return>", lambda _e: _ok())
+        _present_popup(dlg, self)
+        dlg.after(140, lambda: entry.focus_set() if entry.winfo_exists() else None)
+        dlg.wait_window()
+        return result["value"]
+
+    def _ask_yes_no(self, title: str, prompt: str) -> bool:
+        """RDP-safe replacement for tkinter.messagebox.askyesno."""
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(title)
+        dlg.geometry("380x160")
+        dlg.resizable(False, False)
+        try:
+            dlg.attributes("-toolwindow", True)
+        except Exception:
+            pass
+        result: dict[str, bool] = {"value": False}
+
+        ctk.CTkLabel(dlg, text=prompt, wraplength=344, justify="left").pack(
+            anchor="w", padx=14, pady=(16, 12))
+
+        def _yes() -> None:
+            result["value"] = True
+            dlg.destroy()
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(fill="x", padx=14, pady=(0, 14))
+        btns.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(btns, text="Cancel", fg_color="gray", command=dlg.destroy).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(btns, text="Yes", fg_color="#a13c3c", hover_color="#7d2e2e",
+                      command=_yes).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        _present_popup(dlg, self)
+        dlg.wait_window()
+        return result["value"]
+
     def _new_workflow(self) -> None:
-        import tkinter.simpledialog as sd
-        name = sd.askstring("New workflow", "Enter a name for the new workflow:",
-                            parent=self)
+        name = self._ask_string("New workflow", "Enter a name for the new workflow:")
         if not name or not name.strip():
             return
         name = name.strip()
@@ -855,9 +1041,8 @@ class App(ctk.CTk):
         self.log(f"Created new workflow: {name}")
 
     def _rename_workflow(self) -> None:
-        import tkinter.simpledialog as sd
         old = self.cfg.active_workflow
-        new = sd.askstring("Rename workflow", f"New name for '{old}':", parent=self)
+        new = self._ask_string("Rename workflow", f"New name for '{old}':", initial=old)
         if not new or not new.strip():
             return
         new = new.strip()
@@ -874,10 +1059,9 @@ class App(ctk.CTk):
         self.log(f"Renamed '{old}' → '{new}'")
 
     def _duplicate_workflow(self) -> None:
-        import tkinter.simpledialog as sd
         import copy
         src = self.cfg.active_workflow
-        name = sd.askstring("Copy workflow", f"Name for the copy of '{src}':", parent=self)
+        name = self._ask_string("Copy workflow", f"Name for the copy of '{src}':")
         if not name or not name.strip():
             return
         name = name.strip()
@@ -893,14 +1077,12 @@ class App(ctk.CTk):
         self.log(f"Duplicated '{src}' → '{name}'")
 
     def _delete_workflow(self) -> None:
-        import tkinter.messagebox as mb
         name = self.cfg.active_workflow
         if len(self.cfg.named_workflows) <= 1:
             self.log("Cannot delete the last workflow.")
             return
-        if not mb.askyesno("Delete workflow",
-                           f"Delete workflow '{name}'? This cannot be undone.",
-                           parent=self):
+        if not self._ask_yes_no("Delete workflow",
+                                f"Delete workflow '{name}'? This cannot be undone."):
             return
         del self.cfg.named_workflows[name]
         self.cfg.active_workflow = next(iter(self.cfg.named_workflows))
@@ -1546,6 +1728,7 @@ class App(ctk.CTk):
                     self.model_combo.delete(0, "end")
                     self.model_combo.insert(0, models[0])
                 self.log(f"Fetched {len(models)} models. First: {models[0]}. Type the model name in the Model field.")
+                self.log(f"Models: {models}")
             self.after(0, apply)
 
         threading.Thread(target=work, daemon=True).start()
@@ -1614,14 +1797,21 @@ class StepEditor(ctk.CTkToplevel):
         ctk.CTkButton(btns, text="Save step", command=self._save).grid(
             row=0, column=1, sticky="ew", padx=(6, 0))
 
-        self.after(120, self._grab)
+        _present_popup(self, app)
 
     def _grab(self) -> None:
+        """Re-show and safely re-grab the editor (used after hiding it to let the
+        user pick a region/point on screen). Never blocks the app if the window
+        isn't paintable yet over RDP."""
         try:
-            self.grab_set()
+            self.lift()
+            self.attributes("-topmost", True)
+            self.update_idletasks()
             self.focus_force()
+            self.after(400, lambda: _safe_topmost_off(self))
         except Exception:  # noqa: BLE001
             pass
+        _safe_grab(self)
 
     # -- field builders ------------------------------------------------
     def _label(self, text: str) -> None:
@@ -2426,6 +2616,35 @@ class StepEditor(ctk.CTkToplevel):
         self.destroy()
 
 
+_SINGLE_INSTANCE_SOCK = None
+
+
+def _acquire_single_instance() -> bool:
+    """Return ``True`` if this is the only instance, ``False`` if one is already
+    running.
+
+    Over RDP the app can end up launched several times — run.ps1 relaunches on a
+    startup crash, and the user may double-click / re-run while an earlier window
+    is still up.  Stacked windows are the main reason "tabs/buttons don't work":
+    clicks land on a dead/duplicate window sitting on top.  We guard against that
+    with a socket bound to a fixed localhost port.  Unlike a PID lock file, the
+    OS releases the port the instant the owner exits — even on a hard crash — so
+    there is never a stale lock that would block a legitimate relaunch.
+    """
+    global _SINGLE_INSTANCE_SOCK
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 50713))
+        s.listen(1)
+    except OSError:
+        s.close()
+        return False
+    _SINGLE_INSTANCE_SOCK = s  # keep a reference alive for the whole process
+    return True
+
+
 def main() -> None:
     # Tk sometimes fails to create its internal menu window during startup over
     # RDP / AnyDesk. On most Windows builds this is a fatal native abort (only
@@ -2434,6 +2653,12 @@ def main() -> None:
     # in-process retries so we don't need a full process restart, and print the
     # sentinel string run.ps1 watches for if we still give up.
     import tkinter as _tk
+
+    if not _acquire_single_instance():
+        # Another window is already up; don't stack a second one on top of it.
+        print("Screen AI Assistant is already running — using the existing window.",
+              flush=True)
+        return
 
     app = None
     for attempt in range(1, 6):
@@ -2444,6 +2669,16 @@ def main() -> None:
             msg = str(exc)
             print("Failed to create the menu window", flush=True)
             print(f"Tk startup failed (attempt {attempt}/5): {msg}", flush=True)
+            # A half-built Tk root lingers on screen as a ghost window whose
+            # widgets render detached at the top-left of the screen (the
+            # "floating text" the user sees). Tear it down before retrying so we
+            # never accumulate zombie windows.
+            try:
+                root = _tk._default_root
+                if root is not None:
+                    root.destroy()
+            except Exception:  # noqa: BLE001
+                pass
             time.sleep(min(0.5 * attempt, 2.0))
     if app is None:
         raise SystemExit("Tk could not initialise its window after several attempts.")

@@ -17,24 +17,31 @@ from tkinter import ttk
 from typing import Optional
 
 # ── Dark palette ────────────────────────────────────────────────────────────
-WIN_BG = "#242424"
-FRAME_BG = "#2b2b2b"
-ROW_BG = "#333333"
-BTN = "#1f6aa5"
-BTN_HOVER = "#144870"
-BTN_TEXT = "#dce4ee"
-ENTRY_BG = "#343638"
-ENTRY_FG = "#dce4ee"
-TEXT_BG = "#1d1e1e"
-TEXT_FG = "#dce4ee"
-LABEL_FG = "#dce4ee"
-SEG_ON = "#1f6aa5"
-SEG_OFF = "#3a3a3a"
-SEG_HOVER = "#4a4a4a"
-DISABLED_BG = "#2a2a2a"
-DISABLED_FG = "#777777"
-SCROLLBAR = "#4a4a4a"
-DEFAULT_FONT = ("Segoe UI", 13)
+# A modern, cohesive dark theme.  Deep neutral greys with a single clear blue
+# accent, softened borders, and higher-contrast text than the old flat palette.
+WIN_BG = "#17181c"        # app background (deepest)
+FRAME_BG = "#20222a"      # cards / panels
+ROW_BG = "#282b34"        # list rows / raised strips
+CARD_BORDER = "#30333d"   # subtle separators around panels
+BTN = "#3d7eff"           # primary accent
+BTN_HOVER = "#3169db"     # accent hover
+BTN_TEXT = "#ffffff"
+ENTRY_BG = "#20222a"
+ENTRY_FG = "#e8eaf0"
+ENTRY_BORDER = "#3a3d47"
+ENTRY_FOCUS = "#3d7eff"
+TEXT_BG = "#15161a"
+TEXT_FG = "#e8eaf0"
+LABEL_FG = "#e6e8ee"
+MUTED_FG = "#9aa0ad"      # secondary / hint text
+SEG_ON = "#3d7eff"
+SEG_OFF = "#2b2e37"
+SEG_HOVER = "#363a45"
+DISABLED_BG = "#23252c"
+DISABLED_FG = "#5f636d"
+SCROLLBAR = "#3a3d47"
+DEFAULT_FONT = ("Segoe UI", 12)
+HEADING_FONT = ("Segoe UI Semibold", 14)
 
 _appearance = "Dark"
 
@@ -127,6 +134,37 @@ def _px_to_chars(px: int, font=None) -> int:
     return max(1, round(px / char_w))
 
 
+# Cache tkfont.Font objects so we can measure real rendered text width (which,
+# unlike len(text) * avg_char_width, correctly accounts for wide glyphs and
+# emoji/symbols like ▶ ✎ ✕ 🎯 💾 — the previous estimate under-measured these
+# and clipped button labels).
+_FONT_OBJS: dict = {}
+
+
+def _font_obj(font):
+    key = tuple(font) if isinstance(font, (list, tuple)) else font
+    if key in _FONT_OBJS:
+        return _FONT_OBJS[key]
+    try:
+        f = tkfont.Font(font=font or DEFAULT_FONT)
+    except Exception:
+        f = None
+    _FONT_OBJS[key] = f
+    return f
+
+
+def _measure_text(text: str, font=None) -> int:
+    """Pixel width of ``text`` in ``font`` (falls back to an estimate)."""
+    f = _font_obj(font or DEFAULT_FONT)
+    if f is not None:
+        try:
+            return int(f.measure(text or ""))
+        except Exception:
+            pass
+    char_w, _ = _font_metrics(font or DEFAULT_FONT)
+    return round(len(text or "") * char_w)
+
+
 class _GridMixin:
     """Adds CustomTkinter's tuple support to grid row/column configure."""
 
@@ -160,11 +198,33 @@ def _apply_dark_titlebar(win) -> None:
         pass
 
 
+def _setup_ttk_styles(root) -> None:
+    """Give the ttk widgets we use (scrollbars) a flat dark look that matches
+    the rest of the theme instead of the default light Windows styling."""
+    try:
+        style = ttk.Style(root)
+        try:
+            style.theme_use("clam")  # 'clam' honours custom colours fully
+        except Exception:
+            pass
+        for orient in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(
+                orient,
+                background=SCROLLBAR, troughcolor=FRAME_BG, bordercolor=FRAME_BG,
+                arrowcolor=MUTED_FG, relief="flat", borderwidth=0,
+            )
+            style.map(orient,
+                      background=[("active", SEG_HOVER), ("pressed", BTN)])
+    except Exception:
+        pass
+
+
 # ── top-level windows ───────────────────────────────────────────────────────
 class CTk(_GridMixin, tk.Tk):
     def __init__(self, *args, fg_color=None, **kw):
         super().__init__(*args, **kw)
         self.configure(bg=_resolve_color(fg_color, default=WIN_BG))
+        _setup_ttk_styles(self)
         self.after(60, lambda: _apply_dark_titlebar(self))
 
 
@@ -280,16 +340,19 @@ class CTkButton(_GridMixin, tk.Frame):
         self._apply_state()
 
     def _fit_width(self, text: str, requested: int) -> int:
-        """Requested width, expanded if needed so the label fits without clipping."""
-        char_w, _ = _font_metrics(self._font)
-        text_px = round(len(text or "") * char_w)
-        img_px = 24 if self._imgref is not None else 0
-        pad = 20 if self._anchor in ("center",) else 16
+        """Requested width, expanded if needed so the label fits without clipping.
+
+        Uses real glyph measurement so wide symbols/emoji don't get cut off, and
+        keeps generous horizontal padding for a balanced, modern button.
+        """
+        text_px = _measure_text(text or "", self._font)
+        img_px = 26 if self._imgref is not None else 0
+        pad = 28 if self._anchor in ("center",) else 20
         return max(requested, text_px + img_px + pad)
 
     def _fit_height(self) -> int:
         _, line_h = _font_metrics(self._font)
-        return line_h + 10
+        return line_h + 14
 
     def _paint(self, color) -> None:
         # Bypass the overridden configure() to avoid recursing into _apply_state.
@@ -374,6 +437,9 @@ class CTkEntry(tk.Entry):
             insertbackground=ENTRY_FG,
             disabledbackground=DISABLED_BG,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=ENTRY_BORDER,
+            highlightcolor=ENTRY_FOCUS,
             font=_font,
             justify=justify,
             width=_px_to_chars(width, _font),
@@ -467,10 +533,13 @@ class CTkTextbox(tk.Text):
             fg=_resolve_color(text_color, master, TEXT_FG),
             insertbackground=TEXT_FG,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=ENTRY_BORDER,
+            highlightcolor=ENTRY_FOCUS,
             wrap=wrap,
             height=max(2, round(height / line_h)),
             font=_font,
-            padx=6, pady=4,
+            padx=8, pady=6,
         )
         if width:
             opts["width"] = _px_to_chars(width, _font)
@@ -544,6 +613,24 @@ class CTkScrollableFrame(_GridMixin, tk.Frame):
         except Exception:
             pass
 
+    def set_content_visible(self, visible: bool) -> None:
+        """Show or hide the scrolling content.
+
+        Over RDP the canvas's embedded window is drawn detached at the top-left
+        of the screen whenever this frame's tab isn't the one currently on top
+        (the "floating text"). Hiding the embedded window while the tab is
+        inactive removes that; showing it again — with a forced width/scroll
+        recompute and repaint — restores it cleanly.
+        """
+        try:
+            self._canvas.itemconfigure(
+                self._win, state="normal" if visible else "hidden")
+            if visible:
+                self._on_map()
+                self._canvas.update()
+        except Exception:
+            pass
+
     def _bind_wheel(self):
         try:
             self._canvas.bind_all("<MouseWheel>", self._on_wheel)
@@ -609,17 +696,27 @@ class CTkScrollableFrame(_GridMixin, tk.Frame):
 # ── segmented button ────────────────────────────────────────────────────────
 class CTkSegmentedButton(_GridMixin, tk.Frame):
     def __init__(self, master, values=None, command=None, font=None, **kw):
-        super().__init__(master, bg=_bg_of(master))
+        # A thin border frame gives the group a connected "pill" look.
+        super().__init__(master, bg=CARD_BORDER, highlightthickness=0)
         self._command = command
         self._values = list(values or [])
         self._value = None
         self._btns = {}
         for v in self._values:
-            b = tk.Label(self, text=v, bg=SEG_OFF, fg=BTN_TEXT, font=font or DEFAULT_FONT,
-                         padx=12, pady=4, cursor="hand2")
-            b.pack(side="left", padx=1)
+            b = tk.Label(self, text=v, bg=SEG_OFF, fg=LABEL_FG, font=font or DEFAULT_FONT,
+                         padx=16, pady=6, cursor="hand2")
+            b.pack(side="left", padx=(0, 1))
             b.bind("<Button-1>", lambda _e, val=v: self._pick(val))
+            b.bind("<Enter>", lambda _e, val=v: self._on_hover(val, True))
+            b.bind("<Leave>", lambda _e, val=v: self._on_hover(val, False))
             self._btns[v] = b
+
+    def _on_hover(self, value, entering):
+        if value == self._value:
+            return
+        b = self._btns.get(value)
+        if b is not None:
+            b.configure(bg=SEG_HOVER if entering else SEG_OFF)
 
     def _pick(self, value):
         self.set(value)
@@ -632,7 +729,9 @@ class CTkSegmentedButton(_GridMixin, tk.Frame):
     def set(self, value):
         self._value = value
         for v, b in self._btns.items():
-            b.configure(bg=SEG_ON if v == value else SEG_OFF)
+            is_on = v == value
+            b.configure(bg=SEG_ON if is_on else SEG_OFF,
+                        fg=BTN_TEXT if is_on else LABEL_FG)
 
     def get(self):
         return self._value or ""
@@ -661,16 +760,31 @@ class CTkTabview(_GridMixin, tk.Frame):
 
     def add(self, name):
         frame = CTkFrame(self._content, fg_color=FRAME_BG)
+        # Every tab frame is gridded into the SAME cell and left mapped for the
+        # lifetime of the app; switching tabs just raises one above the others
+        # with tkraise().  Over RDP this is far more reliable than the usual
+        # grid()/grid_forget() approach: unmapping a frame and re-mapping it
+        # later frequently leaves it blank (Tk never repaints it), and content
+        # in a tab that was never mapped renders detached at the top-left of the
+        # screen (the "floating text").  Keeping every tab mapped avoids both.
+        frame.grid(row=0, column=0, sticky="nsew")
         self._tabs[name] = frame
-        btn = tk.Label(self._bar, text=name, bg=SEG_OFF, fg=BTN_TEXT,
-                       font=("Segoe UI", 13), padx=16, pady=6, cursor="hand2")
-        btn.pack(side="left", padx=(0, 2))
+        btn = tk.Label(self._bar, text=name, bg=SEG_OFF, fg=MUTED_FG,
+                       font=("Segoe UI", 12), padx=20, pady=9, cursor="hand2")
+        btn.pack(side="left", padx=(0, 3))
         btn.bind("<Button-1>", lambda _e, n=name: self.set(n))
         btn.bind("<Enter>", lambda _e, n=name: self._hover(n, True))
         btn.bind("<Leave>", lambda _e, n=name: self._hover(n, False))
         self._btns[name] = btn
         if self._current is None:
             self.set(name)
+        else:
+            # A newly-added frame stacks above the others; keep the active tab
+            # on top so it stays visible while the rest of the UI is built.
+            try:
+                self._tabs[self._current].tkraise()
+            except Exception:
+                pass
         return frame
 
     def _hover(self, name, entering):
@@ -681,16 +795,23 @@ class CTkTabview(_GridMixin, tk.Frame):
     def set(self, name):
         if name not in self._tabs:
             return
-        if self._current is not None and self._current in self._tabs:
-            self._tabs[self._current].grid_forget()
-            self._btns[self._current].configure(bg=SEG_OFF)
+        if self._current is not None and self._current in self._btns:
+            self._btns[self._current].configure(bg=SEG_OFF, fg=MUTED_FG)
+            # Push the outgoing tab to the very bottom so it can't bleed through
+            # the incoming one where the latter has empty/background regions
+            # (RDP doesn't always repaint a freshly-raised frame's background).
+            if self._current in self._tabs:
+                try:
+                    self._tabs[self._current].lower()
+                except Exception:
+                    pass
         self._current = name
-        self._tabs[name].grid(row=0, column=0, sticky="nsew")
-        self._btns[name].configure(bg=SEG_ON)
-        # Force a layout pass so content built while this tab was hidden gets
-        # its real geometry immediately instead of appearing blank.
+        self._tabs[name].tkraise()
+        self._btns[name].configure(bg=SEG_ON, fg=BTN_TEXT)
+        # A full update() (not just update_idletasks) forces the raised frame to
+        # actually repaint over RDP instead of leaving the previous tab's pixels.
         try:
-            self._tabs[name].update_idletasks()
+            self._tabs[name].update()
         except Exception:
             pass
         if self._command:
